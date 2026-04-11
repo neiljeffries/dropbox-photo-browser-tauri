@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicehash/tauri/tauri-v2/crates/tauri-cli/schema.json",
+  "productName": "Dropbox Photo Browser",
+  "version": "0.1.0",
+  "identifier": "com.dropbox-photo-browser.app",
+  "build": {
+    "frontendDist": "../src",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": ""
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Dropbox Photo Browser",
+        "width": 900,
+        "height": 700,
+        "minWidth": 480,
+        "minHeight": 400,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://api.dropboxapi.com https://content.dropboxapi.com https://www.dropbox.com; media-src 'self' blob:"
+    }
+  },
+  "plugins": {
+    "opener": {}
+  }
+}

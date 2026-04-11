@@ -1,0 +1,25 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Install Dependencies",
+      "type": "npm",
+      "script": "install",
+      "problemMatcher": []
+    },
+    {
+      "label": "Tauri Dev",
+      "type": "npm",
+      "script": "dev",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Tauri Build",
+      "type": "npm",
+      "script": "build",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

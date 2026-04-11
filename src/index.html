@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dropbox Photo Browser</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 100%;
+    min-height: 100vh;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0f0f10;
+    color: #e8e6e0;
+    overflow-x: hidden;
+  }
+
+  /* ── header ── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px 12px;
+    border-bottom: 1px solid #222;
+  }
+  .header-left { display: flex; align-items: center; gap: 10px; }
+  .dropbox-logo { display: flex; gap: 3px; }
+  .dropbox-logo span {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #0061fe;
+    animation: pulse 2s infinite;
+  }
+  .dropbox-logo span:nth-child(2) { animation-delay: 0.2s; }
+  .dropbox-logo span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.4 } }
+  .header-title { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; color: #e8e6e0; }
+  .header-sub { font-size: 11px; color: #666; margin-top: 1px; }
+  .btn-icon {
+    background: none; border: none; cursor: pointer;
+    color: #888; font-size: 16px; padding: 4px 6px;
+    border-radius: 6px; transition: background 0.15s, color 0.15s;
+  }
+  .btn-icon:hover { background: #1e1e20; color: #e8e6e0; }
+
+  /* ── toolbar ── */
+  .toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px;
+    border-bottom: 1px solid #1a1a1c;
+  }
+  .path-breadcrumb {
+    flex: 1; font-size: 12px; color: #666;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    direction: rtl; text-align: left;
+  }
+  .path-breadcrumb span { color: #0061fe; cursor: pointer; }
+  .path-breadcrumb span:hover { text-decoration: underline; }
+  .btn-sm {
+    background: #1a1a1c; border: 1px solid #2a2a2c; border-radius: 6px;
+    color: #aaa; font-size: 11px; padding: 5px 10px;
+    cursor: pointer; white-space: nowrap; transition: background 0.15s;
+  }
+  .btn-sm:hover { background: #222224; color: #e8e6e0; }
+
+  /* ── states ── */
+  #setup-screen, #auth-screen, #loading-screen {
+    padding: 40px 24px; text-align: center;
+  }
+  .state-icon { font-size: 48px; margin-bottom: 16px; }
+  .state-title { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+  .state-sub { font-size: 12px; color: #666; line-height: 1.6; margin-bottom: 20px; }
+  .input-row { display: flex; gap: 8px; margin-bottom: 12px; }
+  .text-input {
+    flex: 1; background: #1a1a1c; border: 1px solid #2a2a2c;
+    border-radius: 8px; color: #e8e6e0; font-size: 13px;
+    padding: 9px 12px; outline: none;
+  }
+  .text-input::placeholder { color: #555; }
+  .text-input:focus { border-color: #0061fe; }
+  .btn-primary {
+    background: #0061fe; border: none; border-radius: 8px;
+    color: #fff; font-size: 13px; font-weight: 600;
+    padding: 9px 16px; cursor: pointer; white-space: nowrap;
+    transition: background 0.15s;
+  }
+  .btn-primary:hover { background: #0052d6; }
+  .btn-primary:active { background: #0044b0; }
+  .hint { font-size: 11px; color: #555; margin-top: 4px; }
+  .spinner {
+    width: 32px; height: 32px; border-radius: 50%;
+    border: 3px solid #222; border-top-color: #0061fe;
+    animation: spin 0.8s linear infinite; margin: 0 auto 16px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .error-msg { font-size: 12px; color: #e05; background: #1a0005;
+    border: 1px solid #300; border-radius: 6px; padding: 8px 12px; margin-top: 8px; }
+
+  /* ── folder list ── */
+  #folder-list { list-style: none; }
+  .folder-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px; border-bottom: 1px solid #141416;
+    cursor: pointer; transition: background 0.1s;
+  }
+  .folder-item:hover { background: #141416; }
+  .folder-icon { font-size: 18px; flex-shrink: 0; }
+  .folder-name { font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .folder-count { font-size: 11px; color: #555; }
+  .chevron { font-size: 10px; color: #444; }
+
+  /* ── photo grid ── */
+  #photo-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, 120px);
+    gap: 2px;
+    padding: 2px;
+  }
+  .photo-cell {
+    width: 120px; height: 120px;
+    background: #141416;
+    overflow: hidden;
+    cursor: pointer;
+    position: relative;
+  }
+  .photo-cell img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.2s;
+  }
+  .photo-cell:hover img { transform: scale(1.05); }
+  .video-badge {
+    position: absolute; bottom: 4px; right: 4px;
+    background: rgba(0,0,0,0.6); color: #fff;
+    font-size: 10px; padding: 2px 5px;
+    border-radius: 3px; pointer-events: none;
+  }
+  .photo-cell.loading::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, #141416 25%, #1e1e20 50%, #141416 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.2s infinite;
+  }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+  .photo-cell.error { display: flex; align-items: center; justify-content: center; color: #333; font-size: 20px; }
+
+  /* ── lightbox ── */
+  #lightbox {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.95);
+    display: none; flex-direction: column;
+    align-items: center; justify-content: center;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox-img {
+    max-width: calc(100% - 32px);
+    max-height: calc(100% - 80px);
+    object-fit: contain;
+    border-radius: 4px;
+  }
+  #lightbox-vid {
+    width: calc(100% - 32px);
+    max-height: calc(100% - 80px);
+    border-radius: 4px;
+    outline: none;
+    background: #000;
+  }
+  #lightbox-name {
+    position: absolute; bottom: 12px; left: 0; right: 0;
+    text-align: center; font-size: 12px; color: #666;
+  }
+  #lightbox-close {
+    position: absolute; top: 10px; right: 12px;
+    background: none; border: none; color: #666; font-size: 22px;
+    cursor: pointer; padding: 4px 8px;
+  }
+  #lightbox-close:hover { color: #fff; }
+  #lightbox-prev, #lightbox-next {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    background: rgba(255,255,255,0.07); border: none; border-radius: 50%;
+    color: #aaa; font-size: 20px; width: 40px; height: 40px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s;
+  }
+  #lightbox-prev { left: 10px; }
+  #lightbox-next { right: 10px; }
+  #lightbox-prev:hover, #lightbox-next:hover { background: rgba(255,255,255,0.14); color: #fff; }
+
+  /* ── status bar ── */
+  #status-bar {
+    display: none;
+    font-size: 11px; color: #555; text-align: center;
+    padding: 6px; border-top: 1px solid #1a1a1c;
+  }
+  #status-bar.visible { display: block; }
+
+  /* ── load more ── */
+  #load-more-btn {
+    display: none; width: 100%;
+    background: #141416; border: none; border-top: 1px solid #1a1a1c;
+    color: #666; font-size: 12px; padding: 12px;
+    cursor: pointer; transition: background 0.15s;
+  }
+  #load-more-btn.visible { display: block; }
+  #load-more-btn:hover { background: #1a1a1c; color: #aaa; }
+
+  /* ── year slider ── */
+  #year-slider-bar {
+    display: none;
+    padding: 8px 16px 6px;
+    border-bottom: 1px solid #1a1a1c;
+    background: #0f0f10;
+  }
+  #year-slider-bar.visible { display: block; }
+  #year-slider-bar .slider-row {
+    display: flex; align-items: center; gap: 10px;
+  }
+  #year-slider-bar .slider-label {
+    font-size: 32px; font-weight: 600; color: #0061fe;
+    min-width: 80px; text-align: center;
+  }
+  #year-slider {
+    flex: 1; -webkit-appearance: none; appearance: none;
+    height: 4px; border-radius: 2px;
+    background: #222; outline: none;
+    cursor: pointer;
+  }
+  #year-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #0061fe; border: 2px solid #0f0f10;
+    cursor: pointer; transition: transform 0.1s;
+  }
+  #year-slider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+  #year-slider-bar .slider-range {
+    display: flex; justify-content: space-between;
+    font-size: 24px; color: #444; margin-top: 2px;
+    padding: 0 2px;
+  }
+  .year-divider {
+    grid-column: 1 / -1;
+    font-size: 32px; font-weight: 600; color: #fff;
+    padding: 14px 6px 6px;
+    border-bottom: 1px solid #1a1a1c;
+    margin-bottom: 2px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <div class="dropbox-logo">
+      <span></span><span></span><span></span>
+    </div>
+    <div>
+      <div class="header-title">Photo Browser</div>
+      <div class="header-sub" id="account-name">Not connected</div>
+    </div>
+  </div>
+  <div style="display:flex;gap:4px">
+    <button class="btn-icon" id="btn-logout" title="Disconnect" style="display:none">⏻</button>
+  </div>
+</div>
+
+<!-- Setup screen (enter app key) -->
+<div id="setup-screen">
+  <div class="state-icon">🔑</div>
+  <div class="state-title">Connect your Dropbox</div>
+  <div class="state-sub">Paste your Dropbox App Key below.<br>You can find it at dropbox.com/developers/apps</div>
+  <div class="input-row">
+    <input type="text" class="text-input" id="app-key-input" placeholder="e.g. abc123xyz456789" />
+    <button class="btn-primary" id="btn-save-key">Save</button>
+  </div>
+  <div class="hint" id="setup-error"></div>
+</div>
+
+<!-- Auth screen (trigger OAuth) -->
+<div id="auth-screen" style="display:none">
+  <div class="state-icon">📦</div>
+  <div class="state-title">Sign in to Dropbox</div>
+  <div class="state-sub">Click below to authorize this app<br>to access your Dropbox photos.</div>
+  <button class="btn-primary" id="btn-auth">Connect Dropbox →</button>
+  <div class="hint" style="margin-top:12px" id="auth-error"></div>
+  <br>
+  <button class="btn-sm" id="btn-change-key">Change app key</button>
+</div>
+
+<!-- Loading screen -->
+<div id="loading-screen" style="display:none">
+  <div class="spinner"></div>
+  <div id="loading-msg" style="font-size:13px;color:#666">Loading…</div>
+</div>
+
+<!-- Toolbar (shown when browsing) -->
+<div class="toolbar" id="toolbar" style="display:none">
+  <div class="path-breadcrumb" id="path-display">/ <span data-path="">Home</span></div>
+  <button class="btn-sm" id="btn-scan" title="Re-scan folder from Dropbox">⟳ Scan Now</button>
+  <button class="btn-sm" id="btn-clear-cache" title="Clear all cached data">✖ Clear Cache</button>
+  <button class="btn-sm" id="btn-up" style="display:none">↑ Up</button>
+</div>
+
+<!-- Year slider -->
+<div id="year-slider-bar">
+  <div class="slider-row">
+    <span class="slider-label" id="year-label">All</span>
+    <input type="range" id="year-slider" min="0" max="1" value="0" step="1" />
+  </div>
+  <div class="slider-range">
+    <span id="year-min-label"></span>
+    <span id="year-max-label"></span>
+  </div>
+</div>
+
+<!-- Folder list -->
+<ul id="folder-list"></ul>
+
+<!-- Photo grid -->
+<div id="photo-grid"></div>
+
+<!-- Status bar -->
+<div id="status-bar"></div>
+
+<!-- Load more -->
+<button id="load-more-btn">Load more photos</button>
+
+<!-- Lightbox -->
+<div id="lightbox">
+  <button id="lightbox-close">✕</button>
+  <img id="lightbox-img" src="" alt="" />
+  <video id="lightbox-vid" controls style="display:none"></video>
+  <div id="lightbox-name"></div>
+  <button id="lightbox-prev">‹</button>
+  <button id="lightbox-next">›</button>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
