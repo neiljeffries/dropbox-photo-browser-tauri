@@ -8,7 +8,8 @@ const THUMB_SIZE = 'w128h128';
 const DISPLAY_PAGE = 250;
 const ROOT_PATHS = [
   { path: '/camera uploads', label: 'Camera Uploads' },
-  { path: '/ai stuff', label: 'AI Stuff' }
+  { path: '/ai stuff', label: 'AI Stuff' },
+  { path: '/pictures', label: 'Pictures' }
 ];
 const HOME_PATH = '__home__';
 const OAUTH_PORT = 17822;
@@ -323,11 +324,11 @@ function formatCacheAge(timestamp) {
 }
 
 // ── Folder helpers ────────────────────────────────────────────────────────────
-async function fetchFolderEntries(path) {
+async function fetchFolderEntries(path, recursive = false) {
   let allEntries = [];
   let data = await dbxFetch('https://api.dropboxapi.com/2/files/list_folder', {
     path: path || '',
-    recursive: false,
+    recursive,
     include_media_info: true,
     limit: 2000
   });
@@ -345,7 +346,7 @@ async function fetchFolderEntries(path) {
 async function refreshFolderCaches() {
   for (const rp of ROOT_PATHS) {
     try {
-      const entries = await fetchFolderEntries(rp.path);
+      const entries = await fetchFolderEntries(rp.path, true);
       await saveFolderCache(rp.path, entries);
     } catch (e) {
       console.warn('Failed to refresh', rp.path, e.message);
