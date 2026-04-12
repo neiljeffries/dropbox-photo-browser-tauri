@@ -1,6 +1,6 @@
 {
   "name": "dropbox-photo-browser-tauri",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "scripts": {
     "tauri": "tauri",
@@ -10,7 +10,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "face-api.js": "^0.22.2"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

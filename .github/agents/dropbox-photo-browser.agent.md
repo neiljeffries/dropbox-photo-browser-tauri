@@ -102,3 +102,14 @@ There is no `devUrl` in `tauri.conf.json`. Tauri serves `frontendDist` (`../src`
 - ALWAYS update CSP in `tauri.conf.json` when adding new external API connections
 - ALWAYS register new Tauri commands in the `generate_handler![]` macro
 - Keep all frontend logic in `src/app.js` and all styles in `src/index.html`
+
+## Versioning
+
+Every time you make a change to this project, **increment the version number** before finishing:
+
+1. Bump the **patch** version for fixes/tweaks (e.g. `0.2.0` → `0.2.1`), the **minor** version for new features (e.g. `0.2.1` → `0.3.0`).
+2. Update the version in **all three locations** — they must stay in sync:
+   - `package.json` → `"version"` field
+   - `src-tauri/tauri.conf.json` → `"version"` field
+   - `src/index.html` → `<span class="version-info">v…</span>` in the header
+3. Never skip this step. The version stamp is visible in the app header so users can confirm which build they are running.
