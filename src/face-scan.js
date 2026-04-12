@@ -13,8 +13,9 @@ const FaceScan = (() => {
 
   let modelsLoaded = false;
   let faceData = {
-    photos: {},    // photoPath -> [{ box, descriptor, score }]
-    clusters: [],  // [{ id, name, samplePhoto, sampleBox, sampleDescriptor, photoCount, photos }]
+    photos: {},      // photoPath -> [{ box, descriptor, score }]
+    clusters: [],    // [{ id, name, samplePhoto, sampleBox, sampleDescriptor, photoCount, photos }]
+    exclusions: [],  // [{ photoPath, clusterId }] — manual removals to prevent re-assignment
     version: 2,
   };
 
@@ -51,6 +52,7 @@ const FaceScan = (() => {
         }
       }
     }
+    if (!faceData.exclusions) faceData.exclusions = [];
     return faceData;
   }
 
@@ -59,6 +61,7 @@ const FaceScan = (() => {
       version: faceData.version,
       photos: {},
       clusters: faceData.clusters,
+      exclusions: faceData.exclusions || [],
     };
     for (const path in faceData.photos) {
       serializable.photos[path] = faceData.photos[path].map(f => ({
@@ -239,9 +242,9 @@ const FaceScan = (() => {
       photosSinceLastSave++;
       if (faces.length > 0) photosSinceLastCluster++;
 
-      // Periodically rebuild clusters so results appear live
+      // Periodically assign new faces to clusters (preserves manual edits)
       if (photosSinceLastCluster >= CLUSTER_INTERVAL) {
-        rebuildClusters();
+        incrementalCluster();
         photosSinceLastCluster = 0;
       }
 
@@ -259,8 +262,8 @@ const FaceScan = (() => {
       await new Promise(r => setTimeout(r, 5));
     }
 
-    // Final cluster rebuild
-    rebuildClusters();
+    // Final incremental cluster pass
+    incrementalCluster();
 
     scanning = false;
     if (onComplete) onComplete(faceData.clusters);
@@ -416,6 +419,181 @@ const FaceScan = (() => {
     faceData.clusters = clusters;
   }
 
+  // Recalculate a cluster's centroid from its member face descriptors
+  function recalcClusterCentroid(cluster) {
+    const descriptors = [];
+    for (const photoPath of cluster.photos) {
+      const faces = faceData.photos[photoPath];
+      if (!faces) continue;
+      for (const face of faces) {
+        if (face.descriptor?.length === 128 && face.score >= MIN_DETECTION_SCORE) {
+          descriptors.push(face.descriptor);
+        }
+      }
+    }
+    if (descriptors.length === 0) return;
+    const centroid = new Float32Array(128);
+    for (const d of descriptors) {
+      for (let i = 0; i < 128; i++) centroid[i] += d[i];
+    }
+    for (let i = 0; i < 128; i++) centroid[i] /= descriptors.length;
+    cluster.sampleDescriptor = Array.from(centroid);
+  }
+
+  // ── Incremental Clustering ─────────────────────────────────────────────────
+  // Assigns new (unassigned) faces to existing clusters, then clusters
+  // remaining unknowns.  Preserves all manual corrections (merges, renames,
+  // moves) by never breaking apart existing clusters.
+  function incrementalCluster() {
+    // Build set of all photo paths already in a cluster
+    const assignedPhotos = new Set();
+    for (const cluster of faceData.clusters) {
+      for (const p of cluster.photos) assignedPhotos.add(p);
+    }
+
+    // Collect valid faces from unassigned photos
+    const newFaces = [];
+    for (const path in faceData.photos) {
+      if (assignedPhotos.has(path)) continue;
+      for (const face of faceData.photos[path]) {
+        if (face.descriptor?.length === 128 && face.score >= MIN_DETECTION_SCORE) {
+          newFaces.push({ path, face });
+        }
+      }
+    }
+
+    if (newFaces.length === 0) return;
+
+    // Pre-compute cluster centroids as Float32Arrays
+    const clusterCentroids = faceData.clusters.map(c => ({
+      cluster: c,
+      centroid: c.sampleDescriptor instanceof Float32Array
+        ? c.sampleDescriptor : new Float32Array(c.sampleDescriptor),
+    }));
+
+    // Build exclusion lookup: photoPath -> Set of excluded clusterIds
+    const exclusionMap = new Map();
+    for (const ex of (faceData.exclusions || [])) {
+      if (!exclusionMap.has(ex.photoPath)) exclusionMap.set(ex.photoPath, new Set());
+      exclusionMap.get(ex.photoPath).add(ex.clusterId);
+    }
+
+    // Try to assign each new face to the closest existing cluster
+    const unmatched = [];
+    const clusterAdditions = new Map(); // clusterId -> Set<photoPath>
+    for (const entry of newFaces) {
+      const excluded = exclusionMap.get(entry.path);
+      let bestCluster = null;
+      let bestDist = DISTANCE_THRESHOLD;
+      for (const { cluster, centroid } of clusterCentroids) {
+        if (excluded && excluded.has(cluster.id)) continue;
+        const dist = euclideanDistance(entry.face.descriptor, centroid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestCluster = cluster;
+        }
+      }
+      if (bestCluster) {
+        if (!clusterAdditions.has(bestCluster.id)) {
+          clusterAdditions.set(bestCluster.id, new Set());
+        }
+        clusterAdditions.get(bestCluster.id).add(entry.path);
+      } else {
+        unmatched.push(entry);
+      }
+    }
+
+    // Apply assignments to existing clusters and update centroids
+    for (const [clusterId, paths] of clusterAdditions) {
+      const cluster = faceData.clusters.find(c => c.id === clusterId);
+      if (!cluster) continue;
+      const photoSet = new Set(cluster.photos);
+      for (const p of paths) photoSet.add(p);
+      cluster.photos = [...photoSet];
+      cluster.photoCount = cluster.photos.length;
+      recalcClusterCentroid(cluster);
+    }
+
+    // Run Chinese Whispers on unmatched faces to form new clusters
+    if (unmatched.length > 0) {
+      const n = unmatched.length;
+      const neighbors = new Array(n);
+      for (let i = 0; i < n; i++) neighbors[i] = [];
+
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const dist = euclideanDistance(unmatched[i].face.descriptor, unmatched[j].face.descriptor);
+          if (dist < DISTANCE_THRESHOLD) {
+            neighbors[i].push(j);
+            neighbors[j].push(i);
+          }
+        }
+      }
+
+      const labels = new Array(n);
+      for (let i = 0; i < n; i++) labels[i] = i;
+
+      for (let iter = 0; iter < CW_ITERATIONS; iter++) {
+        let changed = false;
+        const order = Array.from({ length: n }, (_, i) => i);
+        for (let i = order.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [order[i], order[j]] = [order[j], order[i]];
+        }
+        for (const i of order) {
+          if (neighbors[i].length === 0) continue;
+          const labelCounts = {};
+          for (const nb of neighbors[i]) {
+            const lbl = labels[nb];
+            labelCounts[lbl] = (labelCounts[lbl] || 0) + 1;
+          }
+          let bestLabel = labels[i], bestCount = 0;
+          for (const lbl in labelCounts) {
+            if (labelCounts[lbl] > bestCount) {
+              bestCount = labelCounts[lbl];
+              bestLabel = parseInt(lbl);
+            }
+          }
+          if (labels[i] !== bestLabel) { labels[i] = bestLabel; changed = true; }
+        }
+        if (!changed) break;
+      }
+
+      const groups = {};
+      for (let i = 0; i < n; i++) {
+        const lbl = labels[i];
+        if (!groups[lbl]) groups[lbl] = [];
+        groups[lbl].push(unmatched[i]);
+      }
+
+      for (const lbl in groups) {
+        const members = groups[lbl];
+        const photos = [...new Set(members.map(m => m.path))];
+        const bestMember = members.reduce((a, b) =>
+          b.face.score > a.face.score ? b : a, members[0]);
+
+        const centroid = new Float32Array(128);
+        for (const m of members) {
+          for (let i = 0; i < 128; i++) centroid[i] += m.face.descriptor[i];
+        }
+        for (let i = 0; i < 128; i++) centroid[i] /= members.length;
+
+        faceData.clusters.push({
+          id: 'face_' + Date.now() + '_' + lbl,
+          name: '',
+          samplePhoto: bestMember.path,
+          sampleBox: bestMember.face.box,
+          sampleDescriptor: Array.from(centroid),
+          photoCount: photos.length,
+          photos,
+        });
+      }
+    }
+
+    // Re-sort by photo count
+    faceData.clusters.sort((a, b) => b.photoCount - a.photoCount);
+  }
+
   // ── Public API ─────────────────────────────────────────────────────────────
   function setCallbacks({ progress, complete }) {
     if (progress) onProgress = progress;
@@ -456,9 +634,16 @@ const FaceScan = (() => {
   }
 
   async function clearFaceData(storageAdapter) {
-    faceData = { photos: {}, clusters: [], version: 2 };
+    faceData = { photos: {}, clusters: [], exclusions: [], version: 2 };
     scanQueue = [];
     await storageAdapter.remove([FACE_DATA_KEY]);
+  }
+
+  // Reset only scan data (re-detect faces) but keep clusters, names, and exclusions
+  async function resetScanData(storageAdapter) {
+    faceData.photos = {};
+    scanQueue = [];
+    await saveFaceData(storageAdapter);
   }
 
   // Merge a cluster into another (manual correction)
@@ -471,6 +656,9 @@ const FaceScan = (() => {
     keep.photos = [...allPhotos];
     keep.photoCount = allPhotos.size;
 
+    // Recalculate centroid from all member face descriptors
+    recalcClusterCentroid(keep);
+
     faceData.clusters = faceData.clusters.filter(c => c.id !== mergeId);
     return true;
   }
@@ -482,6 +670,15 @@ const FaceScan = (() => {
 
     cluster.photos = cluster.photos.filter(p => p !== photoPath);
     cluster.photoCount = cluster.photos.length;
+
+    // Record exclusion so incrementalCluster won't reassign this photo back
+    if (!faceData.exclusions) faceData.exclusions = [];
+    const alreadyExcluded = faceData.exclusions.some(
+      ex => ex.photoPath === photoPath && ex.clusterId === clusterId
+    );
+    if (!alreadyExcluded) {
+      faceData.exclusions.push({ photoPath, clusterId });
+    }
 
     if (cluster.photoCount === 0) {
       faceData.clusters = faceData.clusters.filter(c => c.id !== clusterId);
@@ -526,6 +723,7 @@ const FaceScan = (() => {
     getFaceData,
     getFaceBox,
     clearFaceData,
+    resetScanData,
     rebuildClusters,
     mergeClusters,
     removePhotoFromCluster,

@@ -1,11 +1,9 @@
 [target.x86_64-pc-windows-msvc]
-# Resolve the MSVC linker from the active developer environment instead of
-# hardcoding a machine- and version-specific Visual Studio installation path.
-linker = "link.exe"
+linker = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx86\\x64\\link.exe"
 
 [env]
-# Resolve the compiler and archiver from the active MSVC environment.
-# Build from a Visual Studio Developer Command Prompt (or equivalent CI setup)
-# so LIB, INCLUDE, and PATH are initialized correctly for the installed toolchain.
-CC = { value = "cl.exe", force = true }
-AR = { value = "lib.exe", force = true }
+LIB = { value = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\um\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.22621.0\\ucrt\\x64", force = true }
+INCLUDE = { value = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\include;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\ucrt;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\um;C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\shared", force = true }
+CC = { value = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx86\\x64\\cl.exe", force = true }
+AR = { value = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx86\\x64\\lib.exe", force = true }
+# AR = { value = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx86\\x64\\lib.exe", force = true }

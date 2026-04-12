@@ -1,6 +1,6 @@
 {
   "name": "dropbox-photo-browser-tauri",
-  "version": "0.2.1",
+  "version": "0.3.13",
   "private": true,
   "scripts": {
     "tauri": "tauri",

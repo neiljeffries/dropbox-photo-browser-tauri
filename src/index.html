@@ -379,6 +379,38 @@
   .photo-action-btn:hover { background: rgba(200,0,0,0.8); color: #fff; }
   .photo-action-btn.move-btn:hover { background: rgba(0,97,254,0.8); }
 
+  /* ── multi-select in person detail ── */
+  .photo-cell-wrap .select-checkbox {
+    position: absolute; top: 4px; left: 4px; z-index: 3;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: rgba(0,0,0,0.5); border: 2px solid #666;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    font-size: 13px; color: transparent; transition: all 0.15s;
+  }
+  .photo-cell-wrap .select-checkbox:hover { border-color: #0061fe; }
+  .photo-cell-wrap.selected .select-checkbox {
+    background: #0061fe; border-color: #0061fe; color: #fff;
+  }
+  .photo-cell-wrap.selected { outline: 3px solid #0061fe; outline-offset: -3px; }
+  .bulk-action-bar {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: #1a1a1c; border-top: 1px solid #333;
+    padding: 10px 20px; display: flex; align-items: center; gap: 12px;
+    z-index: 150; box-shadow: 0 -4px 12px rgba(0,0,0,0.4);
+  }
+  .bulk-action-bar .bulk-count { color: #e8e6e0; font-size: 13px; font-weight: 500; }
+  .bulk-action-bar .bulk-btn {
+    padding: 6px 14px; border-radius: 6px; border: 1px solid #444;
+    background: #222; color: #e8e6e0; font-size: 12px; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .bulk-action-bar .bulk-btn:hover { background: #333; }
+  .bulk-action-bar .bulk-btn.danger { border-color: #c00; color: #f66; }
+  .bulk-action-bar .bulk-btn.danger:hover { background: rgba(200,0,0,0.3); }
+  .bulk-action-bar .bulk-btn.primary { border-color: #0061fe; color: #4d9aff; }
+  .bulk-action-bar .bulk-btn.primary:hover { background: rgba(0,97,254,0.2); }
+  .bulk-action-bar .bulk-spacer { flex: 1; }
+
   /* ── reassign modal ── */
   .reassign-modal-bg {
     position: fixed; inset: 0; background: rgba(0,0,0,0.6);
@@ -433,7 +465,7 @@
       <div class="header-sub" id="account-name">Not connected</div>
     </div>
   </div>
-  <span class="version-info">v0.2.1</span>
+  <span class="version-info">v0.3.13</span>
   <div style="display:flex;gap:4px">
     <button class="btn-icon" id="btn-logout" title="Disconnect" style="display:none">⏻</button>
   </div>
