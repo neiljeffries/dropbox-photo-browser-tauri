@@ -116,25 +116,16 @@ async fn oauth_listen(port: u16) -> Result<String, String> {
         .await
         .map_err(|e| format!("Read failed: {}", e))?;
 
-    // Extract the path from "GET /callback?... HTTP/1.1"
+    // Extract the path from "GET /callback?code=...&state=... HTTP/1.1"
     let path = request_line
         .split_whitespace()
         .nth(1)
         .unwrap_or("")
         .to_string();
 
-    // Send a response page that extracts the hash fragment
+    // Send a success page — code flow delivers the code as a query param, no JS needed
     let html = r#"<!DOCTYPE html><html><body>
-<script>
-if(window.location.hash){
-  fetch('/token'+window.location.hash.replace('#','?'))
-    .then(()=>document.body.textContent='Done! You can close this tab.')
-    .catch(()=>document.body.textContent='Error passing token.');
-} else {
-  document.body.textContent='No token found in URL fragment.';
-}
-</script>
-<p>Processing authentication...</p>
+<p>Authentication successful! You can close this tab and return to the app.</p>
 </body></html>"#;
 
     let response = format!(
@@ -143,32 +134,8 @@ if(window.location.hash){
         html
     );
     writer.write_all(response.as_bytes()).await.ok();
-    drop(writer);
 
-    // If the path already has the token (redirect with query params), return it
-    if path.contains("access_token=") {
-        return Ok(path.to_string());
-    }
-
-    // Otherwise, wait for the second request from the JS fetch above
-    let (stream2, _) = listener
-        .accept()
-        .await
-        .map_err(|e| format!("Second accept failed: {}", e))?;
-
-    let (reader2, mut writer2) = stream2.into_split();
-    let mut buf2 = BufReader::new(reader2);
-    let mut line2 = String::new();
-    buf2.read_line(&mut line2)
-        .await
-        .map_err(|e| format!("Read2 failed: {}", e))?;
-
-    let path2 = line2.split_whitespace().nth(1).unwrap_or("").to_string();
-
-    let ok_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-    writer2.write_all(ok_response.as_bytes()).await.ok();
-
-    Ok(path2.to_string())
+    Ok(path.to_string())
 }
 
 fn main() {

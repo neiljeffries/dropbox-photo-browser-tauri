@@ -5,7 +5,9 @@ A lightweight desktop app built with [Tauri v2](https://v2.tauri.app/) for brows
 ## Features
 
 - **OAuth Authentication** — Connects to Dropbox via OAuth 2 implicit grant flow using a local HTTP listener on port 17822
-- **Folder Browsing** — Navigate your Dropbox folder tree with a home screen showing configurable root paths (`/camera uploads`, `/ai stuff`)
+- **Face Recognition (ArcFace)** — Detects faces in photos using SSD MobileNetV1 + FaceLandmark68, extracts 512-dim embeddings via ArcFace ONNX (MobileFaceNet w600k), clusters with Chinese Whispers
+- **People View** — Browse photos by person with automatic clustering, manual merge/rename/reassign, exclusion tracking
+- **Folder Browsing** — Navigate your Dropbox folder tree with a home screen showing configurable root paths (`/camera uploads`, `/ai stuff`, `/pictures`)
 - **Photo Grid** — Thumbnails displayed in a 120×120 grid with shimmer loading placeholders and lazy batch loading (25 at a time via Dropbox thumbnail batch API)
 - **Year Slider** — Filter photos by year with a range slider extracted from EXIF/metadata dates
 - **Lightbox Viewer** — Full-resolution image and video viewer with keyboard navigation (arrow keys, Escape)
@@ -23,6 +25,8 @@ A lightweight desktop app built with [Tauri v2](https://v2.tauri.app/) for brows
 | Frontend | Vanilla HTML/CSS/JS (no framework, no bundler) |
 | Backend state | Rust `HashMap<String, serde_json::Value>` persisted to `store.json` in local app data |
 | API | Dropbox HTTP API v2 (files, thumbnails, user account) |
+| Face detection | face-api.js (SSD MobileNetV1 + FaceLandmark68) |
+| Face embeddings | ArcFace MobileFaceNet w600k via ONNX Runtime Web |
 | Dependencies | `@tauri-apps/api`, `@tauri-apps/plugin-opener`, `@anthropic-ai/sdk` |
 
 ## Prerequisites
@@ -50,7 +54,18 @@ A lightweight desktop app built with [Tauri v2](https://v2.tauri.app/) for brows
    ```
    Or use the VS Code task: `Ctrl+Shift+P` → "Tasks: Run Task" → "Tauri Build"
 
-4. **First launch:**
+4. **Download ArcFace model and ONNX Runtime:**
+
+   **ONNX Runtime Web** — Download the UMD bundle from [npmjs.com/package/onnxruntime-web](https://www.npmjs.com/package/onnxruntime-web) (v1.17+):
+   - Copy `ort.min.js` to `src/lib/`
+   - Copy `ort-wasm-simd.wasm` to `src/lib/` (SIMD-capable WASM backend)
+   - Copy `ort-wasm-simd-threaded.wasm` to `src/lib/` (optional, for threaded mode)
+
+   **ArcFace model** — Download `w600k_mbf.onnx` (~12 MB, InsightFace MobileFaceNet trained on WebFace600K):
+   - From the [InsightFace model zoo](https://github.com/deepinsight/insightface/tree/master/model_zoo) or convert from the official `.pth`
+   - Place it at `src/models/w600k_mbf.onnx`
+
+5. **First launch:**
    - Enter your Dropbox App Key on the setup screen
    - Click "Connect Dropbox" to authorize via your browser
    - Browse your photos

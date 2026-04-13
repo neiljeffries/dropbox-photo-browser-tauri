@@ -6,6 +6,7 @@ const VID_EXTS = new Set(['mp4','mov','avi','mkv','webm']);
 const MEDIA_EXTS = new Set([...IMG_EXTS, ...VID_EXTS]);
 const THUMB_SIZE = 'w128h128';
 const DISPLAY_PAGE = 250;
+const DISPLAY_PAGE_PEOPLE = 80;
 const ROOT_PATHS = [
   { path: '/camera uploads', label: 'Camera Uploads' },
   { path: '/ai stuff', label: 'AI Stuff' },
@@ -16,6 +17,7 @@ const OAUTH_PORT = 17822;
 
 let appKey = '';
 let accessToken = '';
+let refreshToken = '';
 let currentPath = HOME_PATH;
 let photoIndex = [];
 let displayCount = 0;
@@ -123,7 +125,7 @@ function scheduleThumbSave() {
       thumbCacheDirty = false;
       await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
     }
-  }, 2000);
+  }, 5000);
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -131,16 +133,33 @@ async function init() {
   await loadThumbCache();
   await FaceScan.loadFaceData(storage);
 
+  // Auto-merge any clusters with duplicate names (fixes v2→v3 migration splits)
+  const merged = FaceScan.mergeByName();
+  if (merged > 0) {
+    console.log(`[FaceScan] Auto-merged ${merged} duplicate-name clusters on startup`);
+    await FaceScan.saveFaceData(storage);
+  }
+
   // Wire up full-resolution image downloader for face scanning
   FaceScan.setImageDownloader(async (path) => {
-    const res = await fetch('https://content.dropboxapi.com/2/files/download', {
+    const doFetch = () => fetch('https://content.dropboxapi.com/2/files/download', {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + accessToken,
         'Dropbox-API-Arg': JSON.stringify({ path })
       }
     });
-    if (!res.ok) throw new Error('Download failed ' + res.status);
+    let res = await doFetch();
+    // Auto-refresh on 401
+    if (res.status === 401 && refreshToken) {
+      try { await refreshAccessToken(); } catch (_) {}
+      res = await doFetch();
+    }
+    if (!res.ok) {
+      const err = new Error('Download failed ' + res.status);
+      err.status = res.status;
+      throw err;
+    }
     const blob = await res.blob();
     return URL.createObjectURL(blob);
   });
@@ -171,8 +190,11 @@ async function init() {
       }
     },
     complete: async (clusters) => {
+      // Auto-merge clusters that share the same name (from legacy migration or manual renames)
+      const merged = FaceScan.mergeByName();
+      if (merged > 0) console.log(`[FaceScan] Auto-merged ${merged} duplicate-name clusters`);
       faceScanLabel.textContent = 'Face scan complete';
-      faceScanCount.textContent = clusters.length + ' people found';
+      faceScanCount.textContent = FaceScan.getClusters().length + ' people found';
       faceScanFill.style.width = '100%';
       await FaceScan.saveFaceData(storage);
       setTimeout(() => faceScanBar.classList.remove('visible'), 4000);
@@ -182,12 +204,23 @@ async function init() {
     },
   });
 
-  const stored = await storage.get(['appKey', 'accessToken']);
-  appKey      = stored.appKey || '';
-  accessToken = stored.accessToken || '';
+  const stored = await storage.get(['appKey', 'accessToken', 'refreshToken']);
+  appKey       = stored.appKey || '';
+  accessToken  = stored.accessToken || '';
+  refreshToken = stored.refreshToken || '';
 
   if (!appKey) { showScreen('setup'); return; }
-  if (!accessToken) { showScreen('auth'); return; }
+  if (!accessToken && !refreshToken) { showScreen('auth'); return; }
+
+  // If we have a refresh token but no access token, refresh first
+  if (!accessToken && refreshToken) {
+    try {
+      await refreshAccessToken();
+    } catch (e) {
+      showScreen('auth');
+      return;
+    }
+  }
 
   setLoading('Connecting…');
   try {
@@ -198,7 +231,7 @@ async function init() {
   } catch(e) {
     if (e.status === 401) {
       accessToken = '';
-      await storage.remove('accessToken');
+      await storage.remove(['accessToken']);
       showScreen('auth');
     } else {
       showScreen('auth');
@@ -215,7 +248,15 @@ async function dbxFetch(url, body, method = 'POST') {
     headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(url, opts);
+  let res = await fetch(url, opts);
+  // Auto-refresh on 401 if we have a refresh token
+  if (res.status === 401 && refreshToken) {
+    try {
+      await refreshAccessToken();
+      opts.headers = { ...opts.headers, 'Authorization': 'Bearer ' + accessToken };
+      res = await fetch(url, opts);
+    } catch (_) { /* refresh failed, fall through to error */ }
+  }
   if (!res.ok) {
     let detail = '';
     try { detail = await res.text(); } catch(_) {}
@@ -228,7 +269,7 @@ async function dbxFetch(url, body, method = 'POST') {
 
 async function dbxGetThumbnailBatch(paths) {
   const entries = paths.map(p => ({ path: p, format: { '.tag': 'jpeg' }, size: { '.tag': THUMB_SIZE } }));
-  const res = await fetch('https://content.dropboxapi.com/2/files/get_thumbnail_batch', {
+  const doFetch = () => fetch('https://content.dropboxapi.com/2/files/get_thumbnail_batch', {
     method: 'POST',
     headers: {
       'Authorization': 'Bearer ' + accessToken,
@@ -236,18 +277,28 @@ async function dbxGetThumbnailBatch(paths) {
     },
     body: JSON.stringify({ entries })
   });
+  let res = await doFetch();
+  if (res.status === 401 && refreshToken) {
+    try { await refreshAccessToken(); } catch (_) {}
+    res = await doFetch();
+  }
   if (!res.ok) throw new Error('Thumbnail batch failed ' + res.status);
   return res.json();
 }
 
 async function dbxGetFullImage(path) {
-  const res = await fetch('https://content.dropboxapi.com/2/files/download', {
+  const doFetch = () => fetch('https://content.dropboxapi.com/2/files/download', {
     method: 'POST',
     headers: {
       'Authorization': 'Bearer ' + accessToken,
       'Dropbox-API-Arg': JSON.stringify({ path })
     }
   });
+  let res = await doFetch();
+  if (res.status === 401 && refreshToken) {
+    try { await refreshAccessToken(); } catch (_) {}
+    res = await doFetch();
+  }
   if (!res.ok) throw new Error('Download failed');
   const blob = await res.blob();
   return URL.createObjectURL(blob);
@@ -435,10 +486,14 @@ function getFilteredPhotos() {
   return photoIndex;
 }
 
+let _showingMore = false;
 function showMorePhotos() {
+  if (_showingMore) return;
+  _showingMore = true;
   const photos = getFilteredPhotos();
   filteredIndex = photos;
-  const end = Math.min(displayCount + DISPLAY_PAGE, photos.length);
+  const pageSize = peopleClusterId ? DISPLAY_PAGE_PEOPLE : DISPLAY_PAGE;
+  const end = Math.min(displayCount + pageSize, photos.length);
   const needThumbPhotos = [];
   const needThumbCells = [];
 
@@ -523,6 +578,7 @@ function showMorePhotos() {
     loadMoreBtn.classList.remove('visible');
   }
 
+  _showingMore = false;
   if (needThumbPhotos.length > 0) {
     loadThumbnailsForCells(needThumbPhotos, needThumbCells);
   }
@@ -822,21 +878,66 @@ document.addEventListener('keydown', e => {
 // ── OAuth (local HTTP redirect for Tauri) ─────────────────────────────────────
 $('btn-auth').addEventListener('click', startAuth);
 $('btn-change-key').addEventListener('click', async () => {
-  await storage.remove(['accessToken', 'appKey']);
-  appKey = ''; accessToken = '';
+  await storage.remove(['accessToken', 'refreshToken', 'appKey']);
+  appKey = ''; accessToken = ''; refreshToken = '';
   showScreen('setup');
 });
+
+// ── PKCE helpers ──────────────────────────────────────────────────────────────
+function generateCodeVerifier() {
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  return base64url(arr);
+}
+async function generateCodeChallenge(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return base64url(new Uint8Array(digest));
+}
+function base64url(bytes) {
+  let str = '';
+  for (const b of bytes) str += String.fromCharCode(b);
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function refreshAccessToken() {
+  if (!refreshToken) throw new Error('No refresh token');
+  const res = await fetch('https://api.dropboxapi.com/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: appKey,
+    }),
+  });
+  if (!res.ok) {
+    // Refresh token revoked or invalid — clear everything
+    accessToken = '';
+    refreshToken = '';
+    await storage.remove(['accessToken', 'refreshToken']);
+    throw new Error('Token refresh failed ' + res.status);
+  }
+  const data = await res.json();
+  accessToken = data.access_token;
+  await storage.set({ accessToken });
+}
 
 async function startAuth() {
   const redirectUri = `http://localhost:${OAUTH_PORT}/callback`;
   const state = Math.random().toString(36).slice(2);
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = await generateCodeChallenge(codeVerifier);
   await storage.set({ oauthState: state });
 
   const authUrl = `https://www.dropbox.com/oauth2/authorize?` +
     `client_id=${encodeURIComponent(appKey)}` +
-    `&response_type=token` +
+    `&response_type=code` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${state}`;
+    `&state=${state}` +
+    `&code_challenge=${codeChallenge}` +
+    `&code_challenge_method=S256` +
+    `&token_access_type=offline`;
 
   $('auth-error').textContent = '';
 
@@ -846,17 +947,33 @@ async function startAuth() {
 
   try {
     const resultPath = await listenPromise;
-    // resultPath looks like "/token?access_token=...&state=..."
+    // resultPath looks like "/callback?code=...&state=..."
     const params = new URLSearchParams(resultPath.split('?')[1] || '');
-    const token = params.get('access_token');
+    const code = params.get('code');
     const retState = params.get('state');
 
     const stored = await storage.get(['oauthState']);
     if (retState !== stored.oauthState) throw new Error('State mismatch');
-    if (!token) throw new Error('No token returned');
+    if (!code) throw new Error('No authorization code returned');
 
-    accessToken = token;
-    await storage.set({ accessToken });
+    // Exchange authorization code for access + refresh tokens
+    const tokenRes = await fetch('https://api.dropboxapi.com/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        grant_type: 'authorization_code',
+        client_id: appKey,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+      }),
+    });
+    if (!tokenRes.ok) throw new Error('Token exchange failed ' + tokenRes.status);
+    const tokenData = await tokenRes.json();
+
+    accessToken  = tokenData.access_token;
+    refreshToken = tokenData.refresh_token || '';
+    await storage.set({ accessToken, refreshToken });
     await init();
   } catch(e) {
     $('auth-error').textContent = 'Auth failed: ' + (e.message || e);
@@ -900,23 +1017,36 @@ $('btn-up').addEventListener('click', () => {
   }
 });
 $('btn-logout').addEventListener('click', async () => {
-  await storage.remove(['accessToken']);
+  // Revoke the refresh token with Dropbox (best-effort)
+  if (refreshToken) {
+    fetch('https://api.dropboxapi.com/2/auth/token/revoke', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + accessToken },
+    }).catch(() => {});
+  }
+  await storage.remove(['accessToken', 'refreshToken']);
   accessToken = '';
+  refreshToken = '';
   showScreen('auth');
   $('btn-logout').style.display = 'none';
   $('account-name').textContent = 'Not connected';
 });
 loadMoreBtn.addEventListener('click', () => showMorePhotos());
 
-// ── Infinite scroll ───────────────────────────────────────────────────────────
+// ── Infinite scroll (throttled) ───────────────────────────────────────────────
+let _scrollTimer = null;
 window.addEventListener('scroll', () => {
-  const photos = getFilteredPhotos();
-  if (displayCount >= photos.length) return;
-  const scrollBottom = window.scrollY + window.innerHeight;
-  const docHeight = document.body.scrollHeight;
-  if (docHeight - scrollBottom < 400) {
-    showMorePhotos();
-  }
+  if (_scrollTimer) return;
+  _scrollTimer = setTimeout(() => {
+    _scrollTimer = null;
+    const photos = getFilteredPhotos();
+    if (displayCount >= photos.length) return;
+    const scrollBottom = window.scrollY + window.innerHeight;
+    const docHeight = document.body.scrollHeight;
+    if (docHeight - scrollBottom < 400) {
+      showMorePhotos();
+    }
+  }, 100);
 });
 
 // ── Year slider ───────────────────────────────────────────────────────────────
@@ -1445,7 +1575,9 @@ function showPersonPhotos(clusterId) {
   const MONTH_NAMES = ['January','February','March','April','May','June',
     'July','August','September','October','November','December'];
   let lastYearMonth = null;
-  const end = Math.min(DISPLAY_PAGE, personPhotos.length);
+  const end = Math.min(DISPLAY_PAGE_PEOPLE, personPhotos.length);
+  const needThumbPhotos = [];
+  const needThumbCells = [];
   for (let i = 0; i < end; i++) {
     const d = getPhotoDate(personPhotos[i]);
     let ym = null;
@@ -1461,13 +1593,30 @@ function showPersonPhotos(clusterId) {
       photoGrid.appendChild(div);
       lastYearMonth = ym;
     }
-    const { wrap } = createPersonPhotoWrap(personPhotos[i], i, clusterId);
+    const { wrap, cell } = createPersonPhotoWrap(personPhotos[i], i, clusterId);
+    if (!thumbCache[personPhotos[i].path_lower]) {
+      cell.classList.add('loading');
+      needThumbPhotos.push(personPhotos[i]);
+      needThumbCells.push(cell);
+    }
     photoGrid.appendChild(wrap);
   }
 
   displayCount = end;
   statusBar.textContent = `Showing ${end} of ${personPhotos.length} photos for ${cluster.name || 'Unknown Person'}`;
   statusBar.classList.add('visible');
+
+  if (displayCount < personPhotos.length) {
+    loadMoreBtn.textContent = `Show more (${personPhotos.length - displayCount} remaining)`;
+    loadMoreBtn.disabled = false;
+    loadMoreBtn.classList.add('visible');
+  } else {
+    loadMoreBtn.classList.remove('visible');
+  }
+
+  if (needThumbPhotos.length > 0) {
+    loadThumbnailsForCells(needThumbPhotos, needThumbCells);
+  }
 }
 
 // ── Reassign Photo Modal ─────────────────────────────────────────────────
