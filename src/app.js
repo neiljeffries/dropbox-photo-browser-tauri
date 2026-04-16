@@ -1360,22 +1360,6 @@ function renderPeopleGrid() {
       });
       headerRight.appendChild(stopBtn);
     } else {
-      // "Scan New" — refresh folder listings from Dropbox, then scan new photos
-      const scanNewBtn = document.createElement('button');
-      scanNewBtn.className = 'btn-primary';
-      scanNewBtn.style.cssText = 'font-size:11px;padding:6px 12px;';
-      scanNewBtn.textContent = unscanned > 0
-        ? `\ud83d\udd0d Scan New (${unscanned})`
-        : '\ud83d\udd0d Scan New';
-      scanNewBtn.addEventListener('click', async () => {
-        scanNewBtn.disabled = true;
-        scanNewBtn.textContent = '\ud83d\udd0d Refreshing folders…';
-        await refreshFolderCaches();
-        startFaceScanForCurrentFolder();
-        renderPeopleGrid();
-      });
-      headerRight.appendChild(scanNewBtn);
-
       // "Rescan All" — re-detect faces on all photos, keeping clusters/names/exclusions
       if (scannedCount > 0) {
         const rescanBtn = document.createElement('button');
@@ -1787,7 +1771,6 @@ function showPersonPhotos(clusterId) {
   // Header bar for person view
   const header = document.createElement('div');
   header.className = 'people-header';
-  header.style.padding = '12px 16px';
 
   const headerLeftDiv = document.createElement('div');
   const titleRow = document.createElement('div');
@@ -1919,7 +1902,7 @@ function showPersonPhotos(clusterId) {
   });
   header.appendChild(backBtn);
 
-  photoGrid.before(header);
+  document.getElementById('top-bars').appendChild(header);
 
   // Filter to person's photos and display with selection + action overlays
   const personPhotos = photoIndex.filter(p => clusterPhotoPaths.has(p.path_lower));
