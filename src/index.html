@@ -5,6 +5,19 @@
 <title>Dropbox Photo Browser</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  /* ── scroll-to-top button ── */
+  #btn-top {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 900;
+    background: rgba(0,97,254,0.85); color: #fff;
+    border: none; border-radius: 8px; padding: 6px 14px;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    backdrop-filter: blur(8px); box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.25s;
+  }
+  #btn-top.visible { opacity: 1; pointer-events: auto; }
+  #btn-top:hover { background: rgba(0,97,254,1); }
   body {
     width: 100%;
     min-height: 100vh;
@@ -22,6 +35,12 @@
     padding: 14px 16px 12px;
     border-bottom: 1px solid #222;
   }
+  #top-bars {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: #0f0f10;
+  }
   .header-left { display: flex; align-items: center; gap: 10px; }
   .dropbox-logo { display: flex; gap: 3px; }
   .dropbox-logo span {
@@ -35,6 +54,44 @@
   .header-title { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; color: #e8e6e0; }
   .header-sub { font-size: 11px; color: #666; margin-top: 1px; }
   .version-info { font-size: 10px; color: #999; margin-left: auto; align-self: center; padding-right: 8px; }
+
+  /* ── save indicator ── */
+  #save-indicator {
+    display: none;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    color: #888;
+    padding-right: 8px;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+  }
+  #save-indicator.visible {
+    display: flex;
+    opacity: 1;
+  }
+  #save-indicator.fade-out {
+    opacity: 0;
+  }
+  #save-indicator .save-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #4caf50;
+    animation: save-pulse 0.8s ease-in-out infinite;
+  }
+  @keyframes save-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.75); }
+  }
+  #btn-save {
+    background: none; border: 1px solid #333; cursor: pointer;
+    color: #888; font-size: 11px; padding: 2px 8px;
+    border-radius: 4px; transition: background 0.15s, color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  #btn-save:hover { background: #1e1e20; color: #e8e6e0; border-color: #555; }
+  #btn-save:active { background: #0061fe; color: #fff; border-color: #0061fe; }
+  #btn-save.saved { color: #4caf50; border-color: #4caf50; }
   .btn-icon {
     background: none; border: none; cursor: pointer;
     color: #888; font-size: 16px; padding: 4px 6px;
@@ -335,6 +392,16 @@
   }
   .people-back:hover { background: #222224; color: #e8e6e0; }
 
+  /* ── named collection glow ── */
+  .person-card.named {
+    box-shadow: 0 0 6px 2px rgba(255, 185, 0, 0.3);
+    border-color: rgba(255, 185, 0, 0.4);
+  }
+  .person-card.named:hover {
+    box-shadow: 0 2px 10px rgba(255, 185, 0, 0.45);
+    border-color: rgba(255, 185, 0, 0.55);
+  }
+
   /* ── merge mode ── */
   .person-card.selected {
     border-color: #0061fe;
@@ -378,6 +445,7 @@
   }
   .photo-action-btn:hover { background: rgba(200,0,0,0.8); color: #fff; }
   .photo-action-btn.move-btn:hover { background: rgba(0,97,254,0.8); }
+  .photo-action-btn.poster-btn:hover { background: rgba(200,170,0,0.8); }
 
   /* ── multi-select in person detail ── */
   .photo-cell-wrap .select-checkbox {
@@ -434,6 +502,24 @@
   }
   .reassign-person-row .rp-name { font-size: 12px; color: #e8e6e0; font-weight: 500; }
   .reassign-person-row .rp-count { font-size: 10px; color: #666; }
+  .reassign-separator {
+    height: 1px; background: #2a2a2c; margin: 6px 0;
+  }
+  .new-collection-icon {
+    width: 40px; height: 40px; border-radius: 50%;
+    background: #0061fe; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 600; flex-shrink: 0;
+  }
+  .new-collection-input-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .new-collection-input {
+    flex: 1; background: #0f0f10; border: 1px solid #0061fe;
+    border-radius: 6px; color: #e8e6e0; font-size: 12px;
+    padding: 7px 10px; outline: none;
+  }
+  .new-collection-input::placeholder { color: #555; }
 
   /* ── rename hint on person cards ── */
   .person-card .rename-hint {
@@ -454,6 +540,7 @@
 </head>
 <body>
 
+<div id="top-bars">
 <!-- Header -->
 <div class="header">
   <div class="header-left">
@@ -465,11 +552,42 @@
       <div class="header-sub" id="account-name">Not connected</div>
     </div>
   </div>
+  <div id="save-indicator"><span class="save-dot"></span>Saving…</div>
+  <button id="btn-save" title="Save now (resets auto-save timer)">💾 Save</button>
   <span class="version-info">v0.4.0</span>
   <div style="display:flex;gap:4px">
     <button class="btn-icon" id="btn-logout" title="Disconnect" style="display:none">⏻</button>
   </div>
 </div>
+
+<!-- Toolbar (shown when browsing) -->
+<div class="toolbar" id="toolbar" style="display:none">
+  <div class="path-breadcrumb" id="path-display">/ <span data-path="">Home</span></div>
+  <button class="btn-people" id="btn-people" title="Browse by person">👤 People</button>
+  <button class="btn-sm" id="btn-scan" title="Re-scan folder from Dropbox">⟳ Scan Now</button>
+  <button class="btn-sm" id="btn-clear-cache" title="Clear all cached data">✖ Clear Cache</button>
+  <button class="btn-sm" id="btn-up" style="display:none">↑ Up</button>
+</div>
+
+<!-- Face scan progress bar -->
+<div id="face-scan-bar">
+  <span id="face-scan-label">Scanning faces…</span>
+  <div class="scan-progress"><div class="scan-progress-fill" id="face-scan-fill"></div></div>
+  <span id="face-scan-count">0/0</span>
+</div>
+
+<!-- Year slider -->
+<div id="year-slider-bar">
+  <div class="slider-row">
+    <span class="slider-label" id="year-label">All</span>
+    <input type="range" id="year-slider" min="0" max="1" value="0" step="1" />
+  </div>
+  <div class="slider-range">
+    <span id="year-min-label"></span>
+    <span id="year-max-label"></span>
+  </div>
+</div>
+</div><!-- /top-bars -->
 
 <!-- Setup screen (enter app key) -->
 <div id="setup-screen">
@@ -500,34 +618,6 @@
   <div id="loading-msg" style="font-size:13px;color:#666">Loading…</div>
 </div>
 
-<!-- Toolbar (shown when browsing) -->
-<div class="toolbar" id="toolbar" style="display:none">
-  <div class="path-breadcrumb" id="path-display">/ <span data-path="">Home</span></div>
-  <button class="btn-people" id="btn-people" title="Browse by person">👤 People</button>
-  <button class="btn-sm" id="btn-scan" title="Re-scan folder from Dropbox">⟳ Scan Now</button>
-  <button class="btn-sm" id="btn-clear-cache" title="Clear all cached data">✖ Clear Cache</button>
-  <button class="btn-sm" id="btn-up" style="display:none">↑ Up</button>
-</div>
-
-<!-- Face scan progress bar -->
-<div id="face-scan-bar">
-  <span id="face-scan-label">Scanning faces…</span>
-  <div class="scan-progress"><div class="scan-progress-fill" id="face-scan-fill"></div></div>
-  <span id="face-scan-count">0/0</span>
-</div>
-
-<!-- Year slider -->
-<div id="year-slider-bar">
-  <div class="slider-row">
-    <span class="slider-label" id="year-label">All</span>
-    <input type="range" id="year-slider" min="0" max="1" value="0" step="1" />
-  </div>
-  <div class="slider-range">
-    <span id="year-min-label"></span>
-    <span id="year-max-label"></span>
-  </div>
-</div>
-
 <!-- Folder list -->
 <ul id="folder-list"></ul>
 
@@ -552,6 +642,8 @@
   <button id="lightbox-prev">‹</button>
   <button id="lightbox-next">›</button>
 </div>
+
+<button id="btn-top" title="Back to top">↑ Top</button>
 
 <script src="lib/ort.min.js"></script>
 <script src="lib/face-api.min.js"></script>

@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::State;
 
 struct AppStore {
@@ -31,48 +31,78 @@ impl AppStore {
         }
     }
 
-    fn persist(&self) {
-        let data = self.data.lock().unwrap();
-        if let Ok(json) = serde_json::to_string(&*data) {
-            fs::write(&self.path, json).ok();
-        }
+    /// Snapshot the current data and serialize + write to disk on a background thread.
+    fn persist_async(self: &Arc<Self>) {
+        let data_snapshot = {
+            let data = self.data.lock().unwrap();
+            data.clone()
+        };
+        let path = self.path.clone();
+        std::thread::spawn(move || {
+            if let Ok(json) = serde_json::to_string(&data_snapshot) {
+                fs::write(&path, json).ok();
+            }
+        });
     }
 }
 
 #[tauri::command]
-fn store_get(key: String, store: State<'_, AppStore>) -> Option<Value> {
+fn store_get(key: String, store: State<'_, Arc<AppStore>>) -> Option<Value> {
     let data = store.data.lock().unwrap();
     data.get(&key).cloned()
 }
 
 #[tauri::command]
-fn store_set(key: String, value: Value, store: State<'_, AppStore>) {
+fn store_get_batch(keys: Vec<String>, store: State<'_, Arc<AppStore>>) -> HashMap<String, Value> {
+    let data = store.data.lock().unwrap();
+    let mut result = HashMap::new();
+    for k in keys {
+        if let Some(v) = data.get(&k) {
+            result.insert(k, v.clone());
+        }
+    }
+    result
+}
+
+#[tauri::command]
+fn store_set(key: String, value: Value, store: State<'_, Arc<AppStore>>) {
     {
         let mut data = store.data.lock().unwrap();
         data.insert(key, value);
     }
-    store.persist();
+    store.inner().persist_async();
 }
 
 #[tauri::command]
-fn store_remove(keys: Vec<String>, store: State<'_, AppStore>) {
+fn store_set_batch(entries: HashMap<String, Value>, store: State<'_, Arc<AppStore>>) {
+    {
+        let mut data = store.data.lock().unwrap();
+        for (k, v) in entries {
+            data.insert(k, v);
+        }
+    }
+    store.inner().persist_async();
+}
+
+#[tauri::command]
+fn store_remove(keys: Vec<String>, store: State<'_, Arc<AppStore>>) {
     {
         let mut data = store.data.lock().unwrap();
         for k in &keys {
             data.remove(k);
         }
     }
-    store.persist();
+    store.inner().persist_async();
 }
 
 #[tauri::command]
-fn store_keys(store: State<'_, AppStore>) -> Vec<String> {
+fn store_keys(store: State<'_, Arc<AppStore>>) -> Vec<String> {
     let data = store.data.lock().unwrap();
     data.keys().cloned().collect()
 }
 
 #[tauri::command]
-fn store_clear_cache(prefix: String, thumb_key: String, store: State<'_, AppStore>) {
+fn store_clear_cache(prefix: String, thumb_key: String, store: State<'_, Arc<AppStore>>) {
     {
         let mut data = store.data.lock().unwrap();
         let to_remove: Vec<String> = data
@@ -84,11 +114,11 @@ fn store_clear_cache(prefix: String, thumb_key: String, store: State<'_, AppStor
             data.remove(&k);
         }
     }
-    store.persist();
+    store.inner().persist_async();
 }
 
 #[tauri::command]
-fn store_get_all(store: State<'_, AppStore>) -> HashMap<String, Value> {
+fn store_get_all(store: State<'_, Arc<AppStore>>) -> HashMap<String, Value> {
     let data = store.data.lock().unwrap();
     data.clone()
 }
@@ -141,10 +171,12 @@ async fn oauth_listen(port: u16) -> Result<String, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppStore::new())
+        .manage(Arc::new(AppStore::new()))
         .invoke_handler(tauri::generate_handler![
             store_get,
+            store_get_batch,
             store_set,
+            store_set_batch,
             store_remove,
             store_keys,
             store_clear_cache,

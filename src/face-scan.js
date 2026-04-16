@@ -10,7 +10,7 @@ const FaceScan = (() => {
   const FACE_DATA_KEY = 'faceDataStore_v3';
   const LEGACY_FACE_DATA_KEY = 'faceDataStore_v2';
   const DESCRIPTOR_DIM = 512;
-  const DISTANCE_THRESHOLD = 0.55;  // Cosine distance threshold for same-person match
+  const DISTANCE_THRESHOLD = 0.65;  // Cosine distance threshold for same-person match
   const MIN_FACE_SIZE = 50;         // Minimum face width in pixels
   const MIN_DETECTION_SCORE = 0.6;  // Minimum detection confidence
   const CW_ITERATIONS = 50;         // Chinese Whispers iterations
@@ -52,7 +52,7 @@ const FaceScan = (() => {
     // (ort.min.js lives in /lib/, so relative './lib/' resolves to /lib/lib/)
     ort.env.wasm.wasmPaths = '/lib/';
     ort.env.wasm.numThreads = 1;   // Avoid SharedArrayBuffer requirement in Tauri webview
-    ort.env.wasm.proxy = false;     // Run inference on main thread (no proxy worker)
+    ort.env.wasm.proxy = true;      // Run inference in a Web Worker to keep UI responsive
     // Face-api.js: detection + landmarks only (no recognition model)
     console.log('[FaceScan] Loading face-api.js detection models…');
     await Promise.all([
@@ -258,7 +258,11 @@ const FaceScan = (() => {
     const results = await arcfaceSession.run({ [inputName]: input });
     const outputName = arcfaceSession.outputNames[0];
     const raw = results[outputName].data;
-    return l2Normalize(raw);
+    const descriptor = l2Normalize(raw);
+    // Dispose tensors to prevent WASM memory leak during long scans
+    input.dispose();
+    if (results[outputName].dispose) results[outputName].dispose();
+    return descriptor;
   }
 
   function l2Normalize(vec) {
@@ -279,6 +283,14 @@ const FaceScan = (() => {
   }
 
   // ── Face Detection ─────────────────────────────────────────────────────────
+  // Release canvas GPU/bitmap memory
+  function releaseCanvas(canvasOrImg) {
+    if (canvasOrImg && canvasOrImg.tagName === 'CANVAS') {
+      canvasOrImg.width = 0;
+      canvasOrImg.height = 0;
+    }
+  }
+
   async function detectFaces(imgElement) {
     const input = downscaleForDetection(imgElement);
     const options = new faceapi.SsdMobilenetv1Options({
@@ -294,6 +306,7 @@ const FaceScan = (() => {
       if (d.detection.box.width < MIN_FACE_SIZE || d.detection.box.height < MIN_FACE_SIZE) continue;
       const aligned = alignFace(input, d.landmarks);
       const descriptor = await arcfaceEmbed(aligned);
+      releaseCanvas(aligned);
       faces.push({
         box: {
           x: Math.round(d.detection.box.x),
@@ -305,6 +318,7 @@ const FaceScan = (() => {
         score: d.detection.score,
       });
     }
+    releaseCanvas(input);
     return faces;
   }
 
@@ -353,6 +367,7 @@ const FaceScan = (() => {
         if (d.detection.box.width < 30) continue;
         const aligned = alignFace(input, d.landmarks);
         const descriptor = await arcfaceEmbed(aligned);
+        releaseCanvas(aligned);
         faces.push({
           box: {
             x: Math.round(d.detection.box.x),
@@ -364,6 +379,7 @@ const FaceScan = (() => {
           score: d.detection.score,
         });
       }
+      releaseCanvas(input);
       faceData.photos[photoPath] = faces;
       _dirtyPhotos.add(photoPath);
       return faces;
@@ -414,64 +430,69 @@ const FaceScan = (() => {
     const CLUSTER_INTERVAL = 5;
     const SAVE_INTERVAL = 50;
 
-    while (scanQueue.length > 0 && !scanAbort) {
-      const item = scanQueue.shift();
-      if (faceData.photos[item.path]) { scanned++; continue; }
+    try {
+      while (scanQueue.length > 0 && !scanAbort) {
+        const item = scanQueue.shift();
+        if (faceData.photos[item.path]) { scanned++; continue; }
 
-      let faces;
-      try {
-        if (item.fullRes && _imageDownloader) {
-          faces = await scanPhotoFullRes(item.path);
-        } else if (item.thumbDataUrl) {
-          faces = await scanPhotoThumb(item.thumbDataUrl, item.path);
-        } else {
+        let faces;
+        try {
+          if (item.fullRes && _imageDownloader) {
+            faces = await scanPhotoFullRes(item.path);
+          } else if (item.thumbDataUrl) {
+            faces = await scanPhotoThumb(item.thumbDataUrl, item.path);
+          } else {
+            faceData.photos[item.path] = [];
+            _dirtyPhotos.add(item.path);
+            faces = [];
+          }
+        } catch (e) {
+          if (e.status === 401 || e.status === 403) {
+            console.error('[FaceScan] Auth error — aborting scan. Token may have expired.');
+            scanQueue.length = 0;
+            break;
+          }
+          console.error('[FaceScan] Error scanning', item.path, e);
           faceData.photos[item.path] = [];
           _dirtyPhotos.add(item.path);
           faces = [];
         }
-      } catch (e) {
-        if (e.status === 401 || e.status === 403) {
-          console.error('[FaceScan] Auth error — aborting scan. Token may have expired.');
-          scanQueue.length = 0;
-          scanning = false;
-          if (onComplete) onComplete(faceData.clusters);
-          return;
+
+        facesFound += faces.length;
+        scanned++;
+        photosSinceLastSave++;
+        if (faces.length > 0) photosSinceLastCluster++;
+
+        if (photosSinceLastCluster >= CLUSTER_INTERVAL) {
+          await incrementalCluster();
+          photosSinceLastCluster = 0;
         }
-        throw e;
+
+        if (photosSinceLastSave >= SAVE_INTERVAL && _storageAdapter) {
+          await new Promise(r => setTimeout(r, 0));
+          await saveFaceData(_storageAdapter);
+          photosSinceLastSave = 0;
+        }
+
+        if (onProgress) {
+          onProgress(scanned, totalQueued, facesFound, faceData.clusters);
+        }
+
+        await new Promise(r => setTimeout(r, 30));
+      }
+    } catch (e) {
+      console.error('[FaceScan] Unexpected scan error:', e);
+    } finally {
+      // Always runs — even after errors or abort
+      await incrementalCluster();
+
+      if (faceData.legacyNames && Object.keys(faceData.legacyNames).length > 0) {
+        restoreLegacyNames();
       }
 
-      facesFound += faces.length;
-      scanned++;
-      photosSinceLastSave++;
-      if (faces.length > 0) photosSinceLastCluster++;
-
-      if (photosSinceLastCluster >= CLUSTER_INTERVAL) {
-        incrementalCluster();
-        photosSinceLastCluster = 0;
-      }
-
-      if (photosSinceLastSave >= SAVE_INTERVAL && _storageAdapter) {
-        await saveFaceData(_storageAdapter);
-        photosSinceLastSave = 0;
-      }
-
-      if (onProgress) {
-        onProgress(scanned, totalQueued, facesFound, faceData.clusters);
-      }
-
-      await new Promise(r => setTimeout(r, 5));
+      scanning = false;
+      if (onComplete) onComplete(faceData.clusters);
     }
-
-    // Final incremental cluster pass
-    incrementalCluster();
-
-    // After first scan completes, try to restore legacy names by photo overlap
-    if (faceData.legacyNames && Object.keys(faceData.legacyNames).length > 0) {
-      restoreLegacyNames();
-    }
-
-    scanning = false;
-    if (onComplete) onComplete(faceData.clusters);
   }
 
   // Restore cluster names from v2→v3 migration by matching photo paths
@@ -528,7 +549,12 @@ const FaceScan = (() => {
 
   // ── Clustering: Chinese Whispers ───────────────────────────────────────────
 
-  function rebuildClusters() {
+  // Yield to the UI event loop so the window stays responsive during heavy computation
+  function yieldToUI() {
+    return new Promise(r => setTimeout(r, 0));
+  }
+
+  async function rebuildClusters() {
     const allFaces = [];
     for (const path in faceData.photos) {
       for (const face of faceData.photos[path]) {
@@ -555,6 +581,8 @@ const FaceScan = (() => {
           neighbors[j].push(i);
         }
       }
+      // Yield every 50 rows to keep the UI responsive during O(n²) computation
+      if (i % 50 === 0 && i > 0) await yieldToUI();
     }
 
     const labels = new Array(n);
@@ -589,6 +617,8 @@ const FaceScan = (() => {
         }
       }
       if (!changed) break;
+      // Yield between CW iterations to keep the UI alive
+      if (iter % 5 === 0) await yieldToUI();
     }
 
     const groups = {};
@@ -671,7 +701,7 @@ const FaceScan = (() => {
   }
 
   // ── Incremental Clustering ─────────────────────────────────────────────────
-  function incrementalCluster() {
+  async function incrementalCluster() {
     const assignedPhotos = new Set();
     for (const cluster of faceData.clusters) {
       for (const p of cluster.photos) assignedPhotos.add(p);
@@ -689,6 +719,8 @@ const FaceScan = (() => {
 
     if (newFaces.length === 0) return;
 
+    console.log(`[FaceScan] incrementalCluster: ${newFaces.length} new faces to assign across ${faceData.clusters.length} existing clusters`);
+
     const clusterCentroids = faceData.clusters.map(c => ({
       cluster: c,
       centroid: c.sampleDescriptor instanceof Float32Array
@@ -703,24 +735,56 @@ const FaceScan = (() => {
 
     const unmatched = [];
     const clusterAdditions = new Map();
+
+    // Separate named vs unnamed centroids for priority matching
+    const namedCentroids = clusterCentroids.filter(c => c.cluster.name);
+    const NAMED_BOOST = 0.12; // Named clusters get this much extra distance tolerance
+
     for (const entry of newFaces) {
       const excluded = exclusionMap.get(entry.path);
-      let bestCluster = null;
-      let bestDist = DISTANCE_THRESHOLD;
+
+      // Pass 1: Find best named cluster match (with boosted threshold)
+      let bestNamed = null;
+      let bestNamedDist = DISTANCE_THRESHOLD + NAMED_BOOST;
+      for (const { cluster, centroid } of namedCentroids) {
+        if (excluded && excluded.has(cluster.id)) continue;
+        const dist = cosineDistance(entry.face.descriptor, centroid);
+        if (dist < bestNamedDist) {
+          bestNamedDist = dist;
+          bestNamed = cluster;
+        }
+      }
+
+      // Pass 2: Find best overall cluster match (strict threshold)
+      let bestAny = null;
+      let bestAnyDist = DISTANCE_THRESHOLD;
+      const distanceLog = [];
       for (const { cluster, centroid } of clusterCentroids) {
         if (excluded && excluded.has(cluster.id)) continue;
         const dist = cosineDistance(entry.face.descriptor, centroid);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestCluster = cluster;
+        distanceLog.push({ name: cluster.name || cluster.id, dist: dist.toFixed(4) });
+        if (dist < bestAnyDist) {
+          bestAnyDist = dist;
+          bestAny = cluster;
         }
       }
+
+      // Prefer named cluster if it matched (even if unnamed is closer)
+      const bestCluster = bestNamed && bestNamedDist < (DISTANCE_THRESHOLD + NAMED_BOOST)
+        ? bestNamed : bestAny;
+      const bestDist = bestCluster === bestNamed ? bestNamedDist : bestAnyDist;
+
+      // Sort by distance for readable logging
+      distanceLog.sort((a, b) => parseFloat(a.dist) - parseFloat(b.dist));
+      const top5 = distanceLog.slice(0, 5).map(d => `${d.name}: ${d.dist}`).join(', ');
       if (bestCluster) {
+        console.log(`[FaceScan] ✅ MATCHED "${entry.path}" → cluster "${bestCluster.name || bestCluster.id}" (dist=${bestDist.toFixed(4)}, named=${!!bestCluster.name}) | Top: ${top5}`);
         if (!clusterAdditions.has(bestCluster.id)) {
           clusterAdditions.set(bestCluster.id, new Set());
         }
         clusterAdditions.get(bestCluster.id).add(entry.path);
       } else {
+        console.log(`[FaceScan] ❌ NO MATCH "${entry.path}" (threshold=${DISTANCE_THRESHOLD}) | Closest: ${top5}`);
         unmatched.push(entry);
       }
     }
@@ -736,6 +800,7 @@ const FaceScan = (() => {
     }
 
     if (unmatched.length > 0) {
+      console.log(`[FaceScan] ${unmatched.length} unmatched faces → running Chinese Whispers`);
       const n = unmatched.length;
       const neighbors = new Array(n);
       for (let i = 0; i < n; i++) neighbors[i] = [];
@@ -748,6 +813,7 @@ const FaceScan = (() => {
             neighbors[j].push(i);
           }
         }
+        if (i % 50 === 0 && i > 0) await yieldToUI();
       }
 
       const labels = new Array(n);
@@ -777,6 +843,7 @@ const FaceScan = (() => {
           if (labels[i] !== bestLabel) { labels[i] = bestLabel; changed = true; }
         }
         if (!changed) break;
+        if (iter % 5 === 0) await yieldToUI();
       }
 
       const groups = {};
@@ -919,6 +986,299 @@ const FaceScan = (() => {
     faceData.clusters = faceData.clusters.filter(c => c.id !== clusterId);
   }
 
+  function createClusterFromPhotos(fromClusterId, photoPaths, name) {
+    if (!photoPaths || photoPaths.length === 0) return null;
+    // Pick the first photo with face data as the sample
+    let samplePhoto = photoPaths[0];
+    let sampleBox = null;
+    let sampleDescriptor = null;
+    for (const p of photoPaths) {
+      const faces = faceData.photos[p];
+      if (faces && faces.length > 0) {
+        samplePhoto = p;
+        sampleBox = faces[0].box;
+        sampleDescriptor = Array.from(faces[0].descriptor);
+        break;
+      }
+    }
+    const newCluster = {
+      id: 'face_' + Date.now() + '_new',
+      name: name || '',
+      samplePhoto,
+      sampleBox,
+      sampleDescriptor,
+      photoCount: 0,
+      photos: [],
+    };
+    faceData.clusters.push(newCluster);
+    // Move each photo from source to new cluster
+    for (const p of photoPaths) {
+      movePhotoToCluster(fromClusterId, newCluster.id, p);
+    }
+    return newCluster;
+  }
+
+  /**
+   * Re-cluster a single collection: compute the cluster centroid, find outlier
+   * faces that are too far from it, and reassign them to better-matching clusters
+   * or new clusters. Returns { clusterId, moved, kept } for UI feedback.
+   */
+  async function reclusterCollection(clusterId) {
+    const cluster = faceData.clusters.find(c => c.id === clusterId);
+    if (!cluster) return { clusterId: null, moved: 0, kept: 0 };
+
+    const savedId = cluster.id;
+    const photoCount = Object.keys(faceData.photos).length;
+
+    // If no face descriptors are loaded, scanning is required first
+    if (photoCount === 0) {
+      return { clusterId: savedId, moved: 0, kept: 0, needsScan: true };
+    }
+
+    // Use the cluster's stored centroid to pick one face per photo
+    const ref = cluster.sampleDescriptor instanceof Float32Array
+      ? cluster.sampleDescriptor : new Float32Array(cluster.sampleDescriptor);
+
+    // Gather the BEST-MATCHING face per photo (group photos have many faces)
+    const faces = [];
+    for (const path of cluster.photos) {
+      const photoFaces = faceData.photos[path];
+      if (!photoFaces) continue;
+      let bestFace = null, bestDist = Infinity;
+      for (const face of photoFaces) {
+        if (face.descriptor?.length === DESCRIPTOR_DIM && face.score >= MIN_DETECTION_SCORE) {
+          const dist = cosineDistance(face.descriptor, ref);
+          if (dist < bestDist) { bestDist = dist; bestFace = face; }
+        }
+      }
+      if (bestFace) faces.push({ path, face: bestFace });
+    }
+
+    if (faces.length < 3) {
+      // Not enough face data — may need a scan
+      return { clusterId: savedId, moved: 0, kept: faces.length, needsScan: faces.length < cluster.photos.length };
+    }
+
+    const n = faces.length;
+
+    // Build pairwise distances plus connectivity and avgDist in one O(n²) pass
+    const distMatrix = new Array(n);
+    for (let i = 0; i < n; i++) {
+      distMatrix[i] = new Float32Array(n);
+    }
+    const connectivity = new Float32Array(n);
+    const avgDist = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const d = cosineDistance(faces[i].face.descriptor, faces[j].face.descriptor);
+        distMatrix[i][j] = d;
+        distMatrix[j][i] = d;
+        avgDist[i] += d;
+        avgDist[j] += d;
+        if (d < DISTANCE_THRESHOLD) {
+          connectivity[i]++;
+          connectivity[j]++;
+        }
+      }
+      if (i % 50 === 0 && i > 0) await yieldToUI();
+    }
+    const denom = n - 1;
+    for (let i = 0; i < n; i++) {
+      connectivity[i] /= denom;
+      avgDist[i] /= denom;
+    }
+
+    // Find the median connectivity to establish what "normal" looks like
+    const sortedConn = connectivity.slice().sort();
+    const medianConn = sortedConn[Math.floor(n * 0.5)];
+
+    // Find median average distance
+    const sortedAvg = avgDist.slice().sort();
+    const medianAvg = sortedAvg[Math.floor(n * 0.5)];
+
+    // A face is an outlier if:
+    // - connectivity < 50% of median connectivity, OR
+    // - avg distance > median * 1.5 and connectivity < 0.7
+    // Floor: never flag if connectivity >= 0.85 (very well connected)
+    const connThreshold = Math.max(medianConn * 0.5, 0.3);
+    const distThreshold = medianAvg * 1.5;
+
+    console.log(`[recluster] ${cluster.name || savedId}: ${n} faces`);
+    console.log(`[recluster]   median connectivity=${medianConn.toFixed(3)}, connThreshold=${connThreshold.toFixed(3)}`);
+    console.log(`[recluster]   median avgDist=${medianAvg.toFixed(3)}, distThreshold=${distThreshold.toFixed(3)}`);
+
+    const inliers = [];
+    const outliers = [];
+    for (let i = 0; i < n; i++) {
+      const isOutlier = connectivity[i] < 0.85 && (
+        connectivity[i] < connThreshold ||
+        (avgDist[i] > distThreshold && connectivity[i] < 0.7)
+      );
+      if (isOutlier) {
+        outliers.push(faces[i]);
+        console.log(`[recluster]   OUTLIER: conn=${connectivity[i].toFixed(3)} avg=${avgDist[i].toFixed(3)} ${faces[i].path}`);
+      } else {
+        inliers.push(faces[i]);
+        console.log(`[recluster]   inlier:  conn=${connectivity[i].toFixed(3)} avg=${avgDist[i].toFixed(3)} ${faces[i].path}`);
+      }
+    }
+    console.log(`[recluster] ${inliers.length} inliers, ${outliers.length} outliers`);
+
+    // If no outliers found, nothing to do
+    if (outliers.length === 0) {
+      return { clusterId: savedId, moved: 0, kept: faces.length };
+    }
+
+    // Build centroid list for other clusters
+    const otherCentroids = faceData.clusters
+      .filter(c => c.id !== savedId && c.photos.length > 0)
+      .map(c => ({
+        cluster: c,
+        centroid: c.sampleDescriptor instanceof Float32Array
+          ? c.sampleDescriptor : new Float32Array(c.sampleDescriptor),
+      }));
+
+    // Respect existing exclusions
+    const exclusionMap = new Map();
+    for (const ex of (faceData.exclusions || [])) {
+      if (!exclusionMap.has(ex.photoPath)) exclusionMap.set(ex.photoPath, new Set());
+      exclusionMap.get(ex.photoPath).add(ex.clusterId);
+    }
+
+    const unmatched = [];
+    const additions = new Map(); // clusterId -> Set<path>
+    let movedCount = 0;
+
+    // Try to assign each outlier to a better cluster
+    for (const entry of outliers) {
+      const excluded = exclusionMap.get(entry.path);
+      let bestCluster = null;
+      let bestDist = DISTANCE_THRESHOLD;
+      for (const { cluster: c, centroid: cCentroid } of otherCentroids) {
+        if (excluded && excluded.has(c.id)) continue;
+        const dist = cosineDistance(entry.face.descriptor, cCentroid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestCluster = c;
+        }
+      }
+      if (bestCluster) {
+        if (!additions.has(bestCluster.id)) additions.set(bestCluster.id, new Set());
+        additions.get(bestCluster.id).add(entry.path);
+        movedCount++;
+      } else {
+        unmatched.push(entry);
+      }
+    }
+
+    // Apply matched outliers to their target clusters
+    for (const [cid, paths] of additions) {
+      const c = faceData.clusters.find(cl => cl.id === cid);
+      if (!c) continue;
+      const photoSet = new Set(c.photos);
+      for (const p of paths) photoSet.add(p);
+      c.photos = [...photoSet];
+      c.photoCount = c.photos.length;
+      recalcClusterCentroid(c);
+    }
+
+    // Unmatched outliers that didn't fit anywhere — create new clusters via Chinese Whispers
+    if (unmatched.length > 0) {
+      const n = unmatched.length;
+      const neighbors = new Array(n);
+      for (let i = 0; i < n; i++) neighbors[i] = [];
+      for (let i = 0; i < n; i++) {
+        for (let j = i + 1; j < n; j++) {
+          const dist = cosineDistance(unmatched[i].face.descriptor, unmatched[j].face.descriptor);
+          if (dist < DISTANCE_THRESHOLD) {
+            neighbors[i].push(j);
+            neighbors[j].push(i);
+          }
+        }
+        if (i % 50 === 0 && i > 0) await yieldToUI();
+      }
+
+      const labels = new Array(n);
+      for (let i = 0; i < n; i++) labels[i] = i;
+      for (let iter = 0; iter < CW_ITERATIONS; iter++) {
+        let changed = false;
+        const order = Array.from({ length: n }, (_, i) => i);
+        for (let i = order.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [order[i], order[j]] = [order[j], order[i]];
+        }
+        for (const i of order) {
+          if (neighbors[i].length === 0) continue;
+          const labelCounts = {};
+          for (const nb of neighbors[i]) {
+            const lbl = labels[nb];
+            labelCounts[lbl] = (labelCounts[lbl] || 0) + 1;
+          }
+          let bestLabel = labels[i], bestCount = 0;
+          for (const lbl in labelCounts) {
+            if (labelCounts[lbl] > bestCount) {
+              bestCount = labelCounts[lbl];
+              bestLabel = parseInt(lbl);
+            }
+          }
+          if (labels[i] !== bestLabel) { labels[i] = bestLabel; changed = true; }
+        }
+        if (!changed) break;
+        if (iter % 5 === 0) await yieldToUI();
+      }
+
+      const groups = {};
+      for (let i = 0; i < n; i++) {
+        const lbl = labels[i];
+        if (!groups[lbl]) groups[lbl] = [];
+        groups[lbl].push(unmatched[i]);
+      }
+
+      for (const lbl in groups) {
+        const members = groups[lbl];
+        const photos = [...new Set(members.map(m => m.path))];
+        const bestMember = members.reduce((a, b) =>
+          b.face.score > a.face.score ? b : a, members[0]);
+        const cwCentroid = new Float32Array(DESCRIPTOR_DIM);
+        for (const m of members) {
+          for (let i = 0; i < DESCRIPTOR_DIM; i++) cwCentroid[i] += m.face.descriptor[i];
+        }
+        for (let i = 0; i < DESCRIPTOR_DIM; i++) cwCentroid[i] /= members.length;
+        const normCW = l2Normalize(cwCentroid);
+
+        faceData.clusters.push({
+          id: 'face_' + Date.now() + '_' + lbl,
+          name: '',
+          samplePhoto: bestMember.path,
+          sampleBox: bestMember.face.box,
+          sampleDescriptor: Array.from(normCW),
+          photoCount: photos.length,
+          photos,
+        });
+      }
+      movedCount += unmatched.length;
+    }
+
+    // Update original cluster to only keep inliers
+    const inlierPaths = [...new Set(inliers.map(f => f.path))];
+    cluster.photos = inlierPaths;
+    cluster.photoCount = inlierPaths.length;
+
+    if (cluster.photoCount === 0) {
+      faceData.clusters = faceData.clusters.filter(c => c.id !== savedId);
+    } else {
+      recalcClusterCentroid(cluster);
+    }
+
+    faceData.clusters.sort((a, b) => b.photoCount - a.photoCount);
+
+    return {
+      clusterId: cluster.photoCount > 0 ? savedId : null,
+      moved: movedCount,
+      kept: inlierPaths.length,
+    };
+  }
+
   // Merge all clusters sharing the same name (for legacy migration or manual consolidation)
   function mergeByName() {
     const nameMap = {};
@@ -939,6 +1299,63 @@ const FaceScan = (() => {
     }
     faceData.clusters = faceData.clusters.filter(c => !c._remove);
     return merged;
+  }
+
+  function setClusterPoster(clusterId, photoPath) {
+    const cluster = faceData.clusters.find(c => c.id === clusterId);
+    if (!cluster) return false;
+    cluster.posterPhoto = photoPath;
+    return true;
+  }
+
+  async function rescanCollection(clusterId, progressCb) {
+    const cluster = faceData.clusters.find(c => c.id === clusterId);
+    if (!cluster) return { scanned: 0, faces: 0 };
+
+    await loadModels();
+
+    const paths = cluster.photos.slice();
+    let scanned = 0, facesFound = 0;
+
+    for (const path of paths) {
+      // Clear existing entry so it gets re-scanned
+      delete faceData.photos[path];
+      delete _serializedPhotos[path];
+
+      let faces;
+      try {
+        if (_imageDownloader) {
+          faces = await scanPhotoFullRes(path);
+        } else {
+          faceData.photos[path] = [];
+          _dirtyPhotos.add(path);
+          faces = [];
+        }
+      } catch (e) {
+        if (e.status === 401 || e.status === 403) {
+          console.error('[rescanCollection] Auth error — aborting.');
+          break;
+        }
+        console.warn('[rescanCollection] Error scanning', path, e.message);
+        faceData.photos[path] = [];
+        _dirtyPhotos.add(path);
+        faces = [];
+      }
+
+      scanned++;
+      facesFound += faces.length;
+      if (progressCb) progressCb(scanned, paths.length, facesFound);
+      await new Promise(r => setTimeout(r, 30));
+    }
+
+    // Re-cluster this collection now that we have fresh descriptors
+    await incrementalCluster();
+
+    if (_storageAdapter) {
+      await saveFaceData(_storageAdapter);
+    }
+
+    return { scanned, faces: facesFound };
   }
 
   return {
@@ -967,5 +1384,9 @@ const FaceScan = (() => {
     removePhotoFromCluster,
     movePhotoToCluster,
     deleteCluster,
+    createClusterFromPhotos,
+    reclusterCollection,
+    rescanCollection,
+    setClusterPoster,
   };
 })();

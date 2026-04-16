@@ -25,6 +25,8 @@ let lightboxIdx = 0;
 let allYears = [];
 let filteredIndex = [];
 let thumbCache = {};
+let thumbCacheCount = 0;
+const MAX_THUMB_CACHE_ENTRIES = 20000;
 let photoDateMap = {};  // path_lower → timestamp, built from all folder caches
 let fetchGen = 0;
 let folderCache = [];
@@ -32,6 +34,29 @@ const CACHE_KEY_PREFIX = 'folderCache_';
 const THUMB_CACHE_KEY = 'thumbCacheStore';
 let thumbCacheDirty = false;
 let thumbSaveTimer = null;
+
+// ── Save indicator ──────────────────────────────────────────────────────────
+let _saveCount = 0;
+let _saveFadeTimer = null;
+function showSaveIndicator() {
+  _saveCount++;
+  const el = document.getElementById('save-indicator');
+  if (!el) return;
+  if (_saveFadeTimer) { clearTimeout(_saveFadeTimer); _saveFadeTimer = null; }
+  el.classList.remove('fade-out');
+  el.classList.add('visible');
+}
+function hideSaveIndicator() {
+  _saveCount = Math.max(0, _saveCount - 1);
+  if (_saveCount > 0) return;
+  const el = document.getElementById('save-indicator');
+  if (!el) return;
+  el.classList.add('fade-out');
+  _saveFadeTimer = setTimeout(() => {
+    el.classList.remove('visible', 'fade-out');
+    _saveFadeTimer = null;
+  }, 300);
+}
 
 // ── Storage adapter (wraps Tauri invoke) ──────────────────────────────────────
 const storage = {
@@ -42,16 +67,21 @@ const storage = {
       const all = await invoke('store_get_all');
       return all || {};
     }
-    const result = {};
-    for (const k of keys) {
-      const val = await invoke('store_get', { key: k });
-      if (val !== null && val !== undefined) result[k] = val;
-    }
-    return result;
+    const result = await invoke('store_get_batch', { keys });
+    return result || {};
   },
   async set(obj) {
-    for (const [k, v] of Object.entries(obj)) {
-      await invoke('store_set', { key: k, value: v });
+    const entries = Object.entries(obj);
+    if (entries.length === 0) return;
+    showSaveIndicator();
+    try {
+      if (entries.length === 1) {
+        await invoke('store_set', { key: entries[0][0], value: entries[0][1] });
+      } else {
+        await invoke('store_set_batch', { entries: obj });
+      }
+    } finally {
+      hideSaveIndicator();
     }
   },
   async remove(keys) {
@@ -114,18 +144,92 @@ function setLoading(msg) {
 async function loadThumbCache() {
   const stored = await storage.get([THUMB_CACHE_KEY]);
   thumbCache = stored[THUMB_CACHE_KEY] || {};
+  thumbCacheCount = Object.keys(thumbCache).length;
 }
 
 function scheduleThumbSave() {
   thumbCacheDirty = true;
-  if (thumbSaveTimer) return;
+  if (thumbSaveTimer) clearTimeout(thumbSaveTimer);
   thumbSaveTimer = setTimeout(async () => {
     thumbSaveTimer = null;
     if (thumbCacheDirty) {
       thumbCacheDirty = false;
       await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
     }
-  }, 5000);
+  }, 180000);
+}
+
+// ── Debounced face-data save (avoids multi-second IPC serialization on every action) ──
+let _faceSaveTimer = null;
+let _faceSaveInProgress = false;
+let _faceSavePendingAgain = false;
+
+function scheduleFaceDataSave() {
+  if (_faceSaveTimer) clearTimeout(_faceSaveTimer);
+  // If a save is already in flight, just flag that we need another round
+  if (_faceSaveInProgress) { _faceSavePendingAgain = true; return; }
+  _faceSaveTimer = setTimeout(() => {
+    _faceSaveTimer = null;
+    // Wait for idle so we don't block the user mid-click
+    (typeof requestIdleCallback === 'function' ? requestIdleCallback : setTimeout)(() => _doFaceSave());
+  }, 180000);
+}
+
+async function _doFaceSave() {
+  if (_faceSaveInProgress) { _faceSavePendingAgain = true; return; }
+  _faceSaveInProgress = true;
+  try {
+    await FaceScan.saveFaceData(storage);
+  } finally {
+    _faceSaveInProgress = false;
+    if (_faceSavePendingAgain) {
+      _faceSavePendingAgain = false;
+      scheduleFaceDataSave();
+    }
+  }
+}
+
+// ── Manual save button ──────────────────────────────────────────────────────
+$('btn-save').addEventListener('click', async () => {
+  const btn = $('btn-save');
+  btn.disabled = true;
+  btn.textContent = '💾 Saving…';
+  try {
+    // Save both thumb cache and face data, then reset auto-save timers
+    if (thumbCacheDirty) {
+      thumbCacheDirty = false;
+      await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
+    }
+    if (thumbSaveTimer) { clearTimeout(thumbSaveTimer); thumbSaveTimer = null; }
+    await _doFaceSave();
+    // Reset face save timer (cancels any pending scheduled save)
+    if (_faceSaveTimer) { clearTimeout(_faceSaveTimer); _faceSaveTimer = null; }
+    btn.textContent = '💾 Saved!';
+    btn.classList.add('saved');
+    setTimeout(() => { btn.textContent = '💾 Save'; btn.classList.remove('saved'); }, 1500);
+  } catch (e) {
+    console.error('[Save] Manual save failed:', e);
+    btn.textContent = '💾 Save';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function flushFaceDataSave() {
+  if (_faceSaveTimer) {
+    clearTimeout(_faceSaveTimer);
+    _faceSaveTimer = null;
+  }
+  _faceSavePendingAgain = false;
+  // Wait for any in-flight save to finish, then do one final save
+  if (_faceSaveInProgress) {
+    _faceSavePendingAgain = false;
+    await new Promise(resolve => {
+      const check = () => _faceSaveInProgress ? setTimeout(check, 50) : resolve();
+      check();
+    });
+  }
+  await _doFaceSave();
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -395,14 +499,14 @@ async function fetchFolderEntries(path, recursive = false) {
 
 // Refresh all ROOT_PATHS folder caches from Dropbox and rebuild photoIndex
 async function refreshFolderCaches() {
-  for (const rp of ROOT_PATHS) {
+  await Promise.all(ROOT_PATHS.map(async (rp) => {
     try {
       const entries = await fetchFolderEntries(rp.path, true);
       await saveFolderCache(rp.path, entries);
     } catch (e) {
       console.warn('Failed to refresh', rp.path, e.message);
     }
-  }
+  }));
   await buildPhotoDateMap();
 }
 
@@ -443,13 +547,15 @@ function renderFolderData(path, allEntries, cacheTimestamp) {
 
   folderList.innerHTML = '';
   $('btn-up').style.display = (path && !isRootPath(path)) ? '' : 'none';
+  const folderFrag = document.createDocumentFragment();
   for (const f of folderCache) {
     const li = document.createElement('li');
     li.className = 'folder-item';
     li.innerHTML = `<span class="folder-icon">📁</span><span class="folder-name">${esc(f.name)}</span><span class="chevron">›</span>`;
     li.addEventListener('click', () => browseFolder(f.path_lower));
-    folderList.appendChild(li);
+    folderFrag.appendChild(li);
   }
+  folderList.appendChild(folderFrag);
 
   buildYearSlider();
 
@@ -460,30 +566,86 @@ function renderFolderData(path, allEntries, cacheTimestamp) {
   if (cacheTimestamp) {
     statusBar.textContent += ` · cached ${formatCacheAge(cacheTimestamp)}`;
   }
+
+  // Auto-scan new photos if faces have been scanned before
+  if (FaceScan.getScannedCount() > 0 && !FaceScan.isScanning()) {
+    const unscanned = photoIndex
+      .filter(p => isLikelyPhoto(p))
+      .map(p => p.path_lower)
+      .filter(path => !FaceScan.getFaceData().photos[path]);
+    if (unscanned.length > 0) {
+      console.log(`[AutoScan] ${unscanned.length} new photo(s) detected, queuing for face scan`);
+      FaceScan.queuePhotosForScan(unscanned, true);
+    }
+  }
 }
 
 // ── Display windowing ─────────────────────────────────────────────────────────
+let _filteredCache = null;
+let _filteredCacheKey = '';
+
+function invalidateFilteredCache() {
+  _filteredCache = null;
+  _filteredCacheKey = '';
+}
+
+// After removing photos from the DOM, keep filteredIndex & displayCount in sync
+function syncAfterRemoval(removedPaths) {
+  const removed = removedPaths instanceof Set ? removedPaths : new Set(removedPaths);
+  const before = filteredIndex.length;
+  filteredIndex = filteredIndex.filter(p => !removed.has(p.path_lower));
+  const delta = before - filteredIndex.length;
+  displayCount = Math.max(0, displayCount - delta);
+  invalidateFilteredCache();
+
+  // Re-index remaining cells so data-idx matches the new filteredIndex positions
+  const cells = photoGrid.querySelectorAll('.photo-cell[data-idx]');
+  let idx = 0;
+  for (const cell of cells) {
+    cell.dataset.idx = idx++;
+  }
+}
+
 function getFilteredPhotos() {
-  // When viewing a person's photos, filter to only that cluster's photos
+  // Build a cache key from the current filter state
+  let cacheKey;
+  if (peopleClusterId) {
+    const cluster = FaceScan.getClusters().find(c => c.id === peopleClusterId);
+    cacheKey = 'person:' + peopleClusterId + ':' + (cluster ? cluster.photos.length : 0);
+  } else {
+    const slider = $('year-slider');
+    const selectedIdx = parseInt(slider.value);
+    cacheKey = 'year:' + selectedIdx + ':' + photoIndex.length;
+  }
+
+  if (_filteredCache && _filteredCacheKey === cacheKey) return _filteredCache;
+
+  let result;
   if (peopleClusterId) {
     const cluster = FaceScan.getClusters().find(c => c.id === peopleClusterId);
     if (cluster) {
       const clusterPaths = new Set(cluster.photos);
-      return photoIndex.filter(p => clusterPaths.has(p.path_lower));
+      result = photoIndex.filter(p => clusterPaths.has(p.path_lower));
+    } else {
+      result = photoIndex;
+    }
+  } else {
+    const slider = $('year-slider');
+    const selectedIdx = parseInt(slider.value);
+    const selectedYear = selectedIdx === 0 ? null : allYears[selectedIdx - 1];
+    if (selectedYear) {
+      result = photoIndex.filter(p => {
+        const d = getPhotoDate(p);
+        return d && new Date(d).getFullYear() === selectedYear;
+      });
+    } else {
+      result = photoIndex;
     }
   }
 
-  const slider = $('year-slider');
-  const selectedIdx = parseInt(slider.value);
-  const selectedYear = selectedIdx === 0 ? null : allYears[selectedIdx - 1];
-
-  if (selectedYear) {
-    return photoIndex.filter(p => {
-      const d = getPhotoDate(p);
-      return d && new Date(d).getFullYear() === selectedYear;
-    });
-  }
-  return photoIndex;
+  _filteredCache = result;
+  _filteredCacheKey = cacheKey;
+  return result;
 }
 
 let _showingMore = false;
@@ -513,6 +675,7 @@ function showMorePhotos() {
   const MONTH_NAMES = ['January','February','March','April','May','June',
     'July','August','September','October','November','December'];
 
+  const frag = document.createDocumentFragment();
   for (let i = displayCount; i < end; i++) {
     const d = getPhotoDate(photos[i]);
     let ym = null;
@@ -525,7 +688,7 @@ function showMorePhotos() {
       const div = document.createElement('div');
       div.className = 'year-divider';
       div.textContent = MONTH_NAMES[dt.getMonth()] + ' ' + dt.getFullYear();
-      photoGrid.appendChild(div);
+      frag.appendChild(div);
       lastYearMonth = ym;
     }
     // When viewing a person's photos, use shared helper with selection + actions
@@ -537,7 +700,7 @@ function showMorePhotos() {
         needThumbPhotos.push(photos[i]);
         needThumbCells.push(wrapCell);
       }
-      photoGrid.appendChild(wrap);
+      frag.appendChild(wrap);
       continue;
     }
 
@@ -564,8 +727,9 @@ function showMorePhotos() {
       needThumbCells.push(cell);
     }
 
-    photoGrid.appendChild(cell);
+    frag.appendChild(cell);
   }
+  photoGrid.appendChild(frag);
 
   displayCount = end;
   updateStatus();
@@ -585,6 +749,7 @@ function showMorePhotos() {
 }
 
 function resetAndShowPhotos() {
+  invalidateFilteredCache();
   photoGrid.innerHTML = '';
   displayCount = 0;
   showMorePhotos();
@@ -640,8 +805,10 @@ async function buildPhotoDateMap() {
     }
   }
   // Load all ROOT_PATHS folder caches from storage
+  const cacheKeys = ROOT_PATHS.map(rp => cacheKeyFor(rp.path));
+  const allCached = await storage.get(cacheKeys);
   for (const rp of ROOT_PATHS) {
-    const cached = await loadCachedFolder(rp.path);
+    const cached = allCached[cacheKeyFor(rp.path)];
     if (!cached || !cached.entries) continue;
     for (const entry of cached.entries) {
       if (entry.path_lower && isMedia(entry)) {
@@ -654,19 +821,26 @@ async function buildPhotoDateMap() {
   sortPhotosNewest(photoIndex);
 }
 
-// Pick the most recent cached thumbnail for a cluster
+// Pick the most recent cached thumbnail for a cluster (or use poster override)
+// Returns { thumb, hasAny } — hasAny indicates at least one photo has a cached thumb.
 function getClusterThumb(cluster) {
+  // Use manually chosen poster if set and cached
+  if (cluster.posterPhoto && thumbCache[cluster.posterPhoto]) {
+    return { thumb: thumbCache[cluster.posterPhoto], hasAny: true };
+  }
   let best = null;
   let bestTime = -1;
+  let hasAny = false;
   for (const p of cluster.photos) {
     if (!thumbCache[p]) continue;
+    hasAny = true;
     const t = photoDateMap[p] || 0;
     if (t > bestTime || best === null) {
       bestTime = t;
       best = p;
     }
   }
-  return best ? thumbCache[best] : null;
+  return { thumb: best ? thumbCache[best] : null, hasAny };
 }
 
 function sortPhotosNewest(arr) {
@@ -676,8 +850,8 @@ function sortPhotosNewest(arr) {
 function buildYearSlider() {
   const years = new Set();
   for (const p of photoIndex) {
-    const d = getPhotoDate(p);
-    if (d) years.add(new Date(d).getFullYear());
+    const ts = photoDateMap[p.path_lower];
+    if (ts) years.add(new Date(ts).getFullYear());
   }
   allYears = [...years].sort((a, b) => b - a);
   const bar = $('year-slider-bar');
@@ -710,8 +884,19 @@ async function loadThumbnailsForCells(photos, cells) {
         const entry = result.entries[j];
         if (entry?.['.tag'] === 'success' && entry.thumbnail) {
           const dataUrl = 'data:image/jpeg;base64,' + entry.thumbnail;
+          if (!thumbCache[slice[j].path_lower]) thumbCacheCount++;
           thumbCache[slice[j].path_lower] = dataUrl;
           if (!isVideo(slice[j])) {
+            scheduleThumbSave();
+          }
+          // Evict oldest entries if cache exceeds limit
+          if (thumbCacheCount > MAX_THUMB_CACHE_ENTRIES) {
+            const keys = Object.keys(thumbCache);
+            const evictCount = Math.floor(keys.length * 0.1);
+            for (let k = 0; k < evictCount; k++) {
+              delete thumbCache[keys[k]];
+            }
+            thumbCacheCount = keys.length - evictCount;
             scheduleThumbSave();
           }
           const img = document.createElement('img');
@@ -1000,6 +1185,7 @@ $('btn-clear-cache').addEventListener('click', async () => {
   await invoke('store_clear_cache', { prefix: CACHE_KEY_PREFIX, thumbKey: THUMB_CACHE_KEY });
   await FaceScan.clearFaceData(storage);
   thumbCache = {};
+  thumbCacheCount = 0;
   fullUrlCache = {};
   if (currentPath === HOME_PATH) showHome();
   else browseFolder(currentPath, true);
@@ -1033,14 +1219,16 @@ $('btn-logout').addEventListener('click', async () => {
 });
 loadMoreBtn.addEventListener('click', () => showMorePhotos());
 
-// ── Infinite scroll (throttled) ───────────────────────────────────────────────
+// ── Infinite scroll (throttled) + scroll-to-top button ──────────────────────
+const btnTop = $('btn-top');
+btnTop.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
 let _scrollTimer = null;
 window.addEventListener('scroll', () => {
+  btnTop.classList.toggle('visible', window.scrollY > 400);
   if (_scrollTimer) return;
   _scrollTimer = setTimeout(() => {
     _scrollTimer = null;
-    const photos = getFilteredPhotos();
-    if (displayCount >= photos.length) return;
+    if (displayCount >= filteredIndex.length) return;
     const scrollBottom = window.scrollY + window.innerHeight;
     const docHeight = document.body.scrollHeight;
     if (docHeight - scrollBottom < 400) {
@@ -1102,6 +1290,8 @@ async function showPeopleView() {
 }
 
 function exitPeopleMode() {
+  flushFaceDataSave(); // persist any pending saves before leaving
+  invalidateFilteredCache();
   peopleMode = false;
   peopleClusterId = null;
   cleanupBulkSelection();
@@ -1130,10 +1320,18 @@ function exitPeopleMode() {
 
 function renderPeopleGrid() {
   const clusters = FaceScan.getClusters();
-  const visibleClusters = clusters.filter(c => c.photos.some(p => thumbCache[p]));
   const scannedCount = FaceScan.getScannedCount();
-  const totalImages = photoIndex.filter(p => isLikelyPhoto(p)).length;
+  let totalImages = 0;
+  for (const p of photoIndex) { if (isLikelyPhoto(p)) totalImages++; }
   const unscanned = totalImages - scannedCount;
+
+  // Pre-compute thumbs for all clusters in a single pass
+  const clusterThumbs = new Map();
+  let visibleCount = 0;
+  for (const c of clusters) {
+    const result = getClusterThumb(c);
+    if (result.thumb) { clusterThumbs.set(c.id, result.thumb); visibleCount++; }
+  }
   peopleView.innerHTML = '';
 
   // Header with scan + merge buttons
@@ -1143,7 +1341,7 @@ function renderPeopleGrid() {
   const headerLeft = document.createElement('div');
   headerLeft.innerHTML = `
     <div class="people-title">\ud83d\udc64 People</div>
-    <div class="people-subtitle">${visibleClusters.length} ${visibleClusters.length === 1 ? 'person' : 'people'} found \u00b7 ${scannedCount} of ${totalImages} photos scanned</div>
+    <div class="people-subtitle">${visibleCount} ${visibleCount === 1 ? 'person' : 'people'} found \u00b7 ${scannedCount} of ${totalImages} photos scanned</div>
   `;
   header.appendChild(headerLeft);
 
@@ -1192,12 +1390,31 @@ function renderPeopleGrid() {
           });
         });
         headerRight.appendChild(rescanBtn);
+
       }
     }
   }
 
+  // "Re-cluster" — re-run clustering algorithm on existing face data (show when clusters exist)
+  if (visibleCount > 0 && !FaceScan.isScanning()) {
+    const reclusterBtn = document.createElement('button');
+    reclusterBtn.className = 'btn-people';
+    reclusterBtn.style.cssText = 'font-size:11px;padding:6px 12px;';
+    reclusterBtn.textContent = '\ud83d\udd00 Re-cluster';
+    reclusterBtn.addEventListener('click', async () => {
+      if (!confirm('This will re-group all detected faces into people using the clustering algorithm. Names will be preserved where possible. Continue?')) return;
+      reclusterBtn.disabled = true;
+      reclusterBtn.textContent = '\u23f3 Clustering\u2026';
+      await new Promise(r => setTimeout(r, 50));
+      await FaceScan.rebuildClusters();
+      await FaceScan.saveFaceData(storage);
+      renderPeopleGrid();
+    });
+    headerRight.appendChild(reclusterBtn);
+  }
+
   // Merge toggle button (only when 2+ visible clusters exist)
-  if (visibleClusters.length >= 2) {
+  if (visibleCount >= 2) {
     const mergeBtn = document.createElement('button');
     mergeBtn.className = 'btn-people';
     mergeBtn.style.cssText = 'font-size:11px;padding:6px 12px;';
@@ -1226,7 +1443,7 @@ function renderPeopleGrid() {
     peopleView.appendChild(bar);
   }
 
-  if (visibleClusters.length === 0) {
+  if (visibleCount === 0) {
     const empty = document.createElement('div');
     empty.style.cssText = 'text-align:center;padding:40px;color:#555;font-size:13px;';
     if (FaceScan.isScanning()) {
@@ -1243,14 +1460,23 @@ function renderPeopleGrid() {
   const grid = document.createElement('div');
   grid.className = 'people-grid' + (mergeMode ? ' merge-mode' : '');
 
-  for (const cluster of clusters) {
-    // Pick the most recent photo with a cached thumbnail as the cluster face
-    const thumb = getClusterThumb(cluster);
-    // Skip clusters with no cached thumbnail — don't show blank placeholders
+  // Sort: named clusters first (alphabetical), then unnamed (by photo count desc)
+  const sorted = [...clusters].sort((a, b) => {
+    const aName = a.name ? a.name.toLowerCase() : '';
+    const bName = b.name ? b.name.toLowerCase() : '';
+    if (aName && !bName) return -1;
+    if (!aName && bName) return 1;
+    if (aName && bName) return aName.localeCompare(bName);
+    return b.photoCount - a.photoCount;
+  });
+
+  for (const cluster of sorted) {
+    // Use pre-computed thumb — skip clusters with no cached thumbnail
+    const thumb = clusterThumbs.get(cluster.id);
     if (!thumb) continue;
 
     const card = document.createElement('div');
-    card.className = 'person-card' + (mergeSelected.has(cluster.id) ? ' selected' : '');
+    card.className = 'person-card' + (cluster.name ? ' named' : '') + (mergeSelected.has(cluster.id) ? ' selected' : '');
     card.dataset.clusterId = cluster.id;
 
     // Merge checkbox overlay
@@ -1272,6 +1498,13 @@ function renderPeopleGrid() {
     nameEl.className = 'person-name';
     nameEl.textContent = cluster.name || 'Unknown';
     info.appendChild(nameEl);
+
+    const idEl = document.createElement('div');
+    idEl.className = 'person-count';
+    idEl.style.fontSize = '9px';
+    idEl.style.opacity = '0.5';
+    idEl.textContent = cluster.id;
+    info.appendChild(idEl);
 
     const countEl = document.createElement('div');
     countEl.className = 'person-count';
@@ -1325,10 +1558,10 @@ function renderPeopleGrid() {
       for (let i = 1; i < ids.length; i++) {
         FaceScan.mergeClusters(keepId, ids[i]);
       }
-      await FaceScan.saveFaceData(storage);
       mergeMode = false;
       mergeSelected.clear();
       renderPeopleGrid();
+      FaceScan.saveFaceData(storage);
     });
   }
 }
@@ -1398,17 +1631,18 @@ function updateBulkActionBar() {
     for (const p of selectedPhotoPaths) {
       FaceScan.removePhotoFromCluster(peopleClusterId, p);
     }
-    await FaceScan.saveFaceData(storage);
-    // Remove DOM elements
+    // Update UI immediately, save in background
+    const removedPaths = [...selectedPhotoPaths];
     document.querySelectorAll('.photo-cell-wrap.selected').forEach(w => w.remove());
     selectedPhotoPaths.clear();
     updateBulkActionBar();
-    // Update subtitle
+    syncAfterRemoval(removedPaths);
     const updated = FaceScan.getClusters().find(c => c.id === peopleClusterId);
     const sub = document.querySelector('.people-subtitle');
     if (updated && sub) {
       sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
     }
+    scheduleFaceDataSave();
   });
   bar.appendChild(removeBtn);
 
@@ -1432,22 +1666,18 @@ function createPersonPhotoWrap(photoEntry, gridIdx, clusterId) {
   const wrap = document.createElement('div');
   wrap.className = 'photo-cell-wrap';
   wrap.dataset.photoPath = photoEntry.path_lower;
+  wrap.dataset.clusterId = clusterId;
   if (selectedPhotoPaths.has(photoEntry.path_lower)) wrap.classList.add('selected');
 
-  // Selection checkbox
+  // Selection checkbox (handled by delegated event on photoGrid)
   const checkbox = document.createElement('div');
   checkbox.className = 'select-checkbox';
   checkbox.textContent = '\u2713';
-  checkbox.addEventListener('click', (e) => {
-    e.stopPropagation();
-    togglePhotoSelection(photoEntry.path_lower, wrap);
-  });
   wrap.appendChild(checkbox);
 
   const cell = document.createElement('div');
   cell.className = 'photo-cell';
   cell.dataset.idx = gridIdx;
-  cell.addEventListener('click', () => openLightbox(Number.parseInt(cell.dataset.idx, 10)));
 
   const cached = thumbCache[photoEntry.path_lower];
   if (cached) {
@@ -1458,7 +1688,7 @@ function createPersonPhotoWrap(photoEntry, gridIdx, clusterId) {
   }
   wrap.appendChild(cell);
 
-  // Action bar: remove from person / move to different person
+  // Action bar (buttons handled by delegated event on photoGrid)
   const actionBar = document.createElement('div');
   actionBar.className = 'photo-action-bar';
 
@@ -1466,34 +1696,81 @@ function createPersonPhotoWrap(photoEntry, gridIdx, clusterId) {
   removeBtn.className = 'photo-action-btn';
   removeBtn.title = 'Remove from this person';
   removeBtn.textContent = '\u2716';
-  removeBtn.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    FaceScan.removePhotoFromCluster(clusterId, photoEntry.path_lower);
-    await FaceScan.saveFaceData(storage);
-    wrap.remove();
-    const updated = FaceScan.getClusters().find(c => c.id === clusterId);
-    const sub = document.querySelector('.people-subtitle');
-    if (updated && sub) {
-      sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
-    }
-  });
+  removeBtn.dataset.action = 'remove';
   actionBar.appendChild(removeBtn);
 
   const moveBtn = document.createElement('button');
   moveBtn.className = 'photo-action-btn move-btn';
   moveBtn.title = 'Move to a different person';
   moveBtn.textContent = '\u27a1';
-  moveBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    showReassignModal(clusterId, photoEntry.path_lower, wrap);
-  });
+  moveBtn.dataset.action = 'move';
   actionBar.appendChild(moveBtn);
+
+  const posterBtn = document.createElement('button');
+  posterBtn.className = 'photo-action-btn poster-btn';
+  posterBtn.title = 'Set as collection poster';
+  posterBtn.textContent = '\u2b50';
+  posterBtn.dataset.action = 'poster';
+  actionBar.appendChild(posterBtn);
 
   wrap.appendChild(actionBar);
   return { wrap, cell };
 }
 
+// ── Delegated click handler for person photo grid ────────────────────────────
+// One listener handles all clicks instead of 6+ listeners per photo cell.
+photoGrid.addEventListener('click', async (e) => {
+  if (!peopleClusterId) return;
+
+  const wrap = e.target.closest('.photo-cell-wrap');
+  if (!wrap) return;
+
+  const photoPath = wrap.dataset.photoPath;
+  const clusterId = wrap.dataset.clusterId;
+
+  // Checkbox click
+  if (e.target.closest('.select-checkbox')) {
+    e.stopPropagation();
+    togglePhotoSelection(photoPath, wrap);
+    return;
+  }
+
+  // Action button clicks
+  const actionBtn = e.target.closest('.photo-action-btn');
+  if (actionBtn) {
+    e.stopPropagation();
+    const action = actionBtn.dataset.action;
+
+    if (action === 'remove') {
+      FaceScan.removePhotoFromCluster(clusterId, photoPath);
+      wrap.remove();
+      syncAfterRemoval([photoPath]);
+      const updated = FaceScan.getClusters().find(c => c.id === clusterId);
+      const sub = document.querySelector('.people-subtitle');
+      if (updated && sub) {
+        sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
+      }
+      scheduleFaceDataSave();
+    } else if (action === 'move') {
+      showReassignModal(clusterId, photoPath, wrap);
+    } else if (action === 'poster') {
+      FaceScan.setClusterPoster(clusterId, photoPath);
+      actionBtn.textContent = '\u2713';
+      setTimeout(() => { actionBtn.textContent = '\u2b50'; }, 1000);
+      scheduleFaceDataSave();
+    }
+    return;
+  }
+
+  // Photo cell click → lightbox
+  const cell = e.target.closest('.photo-cell');
+  if (cell && cell.dataset.idx !== undefined) {
+    openLightbox(Number.parseInt(cell.dataset.idx, 10));
+  }
+});
+
 function showPersonPhotos(clusterId) {
+  invalidateFilteredCache();
   peopleClusterId = clusterId;
   selectedPhotoPaths.clear();
   const cluster = FaceScan.getClusters().find(c => c.id === clusterId);
@@ -1505,6 +1782,7 @@ function showPersonPhotos(clusterId) {
   photoGrid.style.display = '';
   photoGrid.innerHTML = '';
   loadMoreBtn.classList.remove('visible');
+  document.querySelectorAll('.people-header').forEach(h => h.remove());
 
   // Header bar for person view
   const header = document.createElement('div');
@@ -1534,11 +1812,11 @@ function showPersonPhotos(clusterId) {
     titleEl.appendChild(input);
     input.focus();
     input.select();
-    const finish = async () => {
+    const finish = () => {
       const newName = input.value.trim();
       FaceScan.renameCluster(clusterId, newName);
-      await FaceScan.saveFaceData(storage);
       titleEl.textContent = newName || 'Unknown Person';
+      FaceScan.saveFaceData(storage);
     };
     input.addEventListener('blur', finish);
     input.addEventListener('keydown', (e) => {
@@ -1547,6 +1825,82 @@ function showPersonPhotos(clusterId) {
     });
   });
   titleRow.appendChild(renameBtn);
+
+  // Re-cluster button for this specific collection
+  const reclusterBtn = document.createElement('button');
+  reclusterBtn.className = 'btn-people';
+  reclusterBtn.style.cssText = 'font-size:10px;padding:3px 8px;';
+  reclusterBtn.textContent = '\ud83d\udd00 Re-cluster';
+  reclusterBtn.addEventListener('click', async () => {
+    console.log('[recluster] button clicked, clusterId=', clusterId);
+    if (!confirm('This will find outlier faces in this collection and move them to better-matching people. Continue?')) return;
+    reclusterBtn.disabled = true;
+    reclusterBtn.textContent = '\u23f3 Clustering\u2026';
+    await new Promise(r => setTimeout(r, 50));
+    try {
+      const result = await FaceScan.reclusterCollection(clusterId);
+      console.log('[recluster] result:', result);
+      if (result.needsScan) {
+        alert('Face scan data is missing for this collection. Use the "Rescan Faces" button first, then try Re-cluster.');
+        reclusterBtn.textContent = '\ud83d\udd00 Re-cluster';
+        reclusterBtn.disabled = false;
+        return;
+      }
+      await FaceScan.saveFaceData(storage);
+      if (result.moved === 0) {
+        reclusterBtn.textContent = '\u2714 No outliers found';
+        reclusterBtn.disabled = false;
+        setTimeout(() => { reclusterBtn.textContent = '\ud83d\udd00 Re-cluster'; }, 2000);
+      } else if (result.clusterId) {
+        alert(`Moved ${result.moved} photo${result.moved !== 1 ? 's' : ''} out, kept ${result.kept}.`);
+        showPersonPhotos(result.clusterId);
+      } else {
+        alert(`All ${result.moved} photos were moved to other collections.`);
+        showPeopleView();
+      }
+    } catch (err) {
+      console.error('[recluster] ERROR:', err);
+      alert('Re-cluster failed: ' + err.message);
+      reclusterBtn.textContent = '\ud83d\udd00 Re-cluster';
+      reclusterBtn.disabled = false;
+    }
+  });
+  titleRow.appendChild(reclusterBtn);
+
+  // Rescan button — re-detect faces for this collection's photos
+  const rescanBtn = document.createElement('button');
+  rescanBtn.className = 'btn-people';
+  rescanBtn.style.cssText = 'font-size:10px;padding:3px 8px;';
+  rescanBtn.textContent = '\uD83D\uDD04 Rescan Faces';
+  rescanBtn.addEventListener('click', async () => {
+    if (!confirm(`This will re-download and re-detect faces for all ${cluster.photoCount} photos in this collection. This may take a while. Continue?`)) return;
+    rescanBtn.disabled = true;
+    reclusterBtn.disabled = true;
+    rescanBtn.textContent = '\u23F3 0/' + cluster.photoCount;
+    try {
+      const result = await FaceScan.rescanCollection(clusterId, (done, total, faces) => {
+        rescanBtn.textContent = `\u23F3 ${done}/${total} (${faces} faces)`;
+      });
+      alert(`Rescan complete: ${result.scanned} photos scanned, ${result.faces} faces found.`);
+      showPersonPhotos(clusterId);
+    } catch (err) {
+      console.error('[rescan] ERROR:', err);
+      alert('Rescan failed: ' + err.message);
+      rescanBtn.textContent = '\uD83D\uDD04 Rescan Faces';
+      rescanBtn.disabled = false;
+      reclusterBtn.disabled = false;
+    }
+  });
+  titleRow.appendChild(rescanBtn);
+
+  // 🔗 Merge button
+  const mergeBtn2 = document.createElement('button');
+  mergeBtn2.className = 'btn-people';
+  mergeBtn2.style.cssText = 'font-size:10px;padding:3px 8px;';
+  mergeBtn2.textContent = '\uD83D\uDD17 Merge';
+  mergeBtn2.addEventListener('click', () => showMergeIntoModal(clusterId));
+  titleRow.appendChild(mergeBtn2);
+
   headerLeftDiv.appendChild(titleRow);
 
   const subtitleEl = document.createElement('div');
@@ -1578,6 +1932,7 @@ function showPersonPhotos(clusterId) {
   const end = Math.min(DISPLAY_PAGE_PEOPLE, personPhotos.length);
   const needThumbPhotos = [];
   const needThumbCells = [];
+  const frag = document.createDocumentFragment();
   for (let i = 0; i < end; i++) {
     const d = getPhotoDate(personPhotos[i]);
     let ym = null;
@@ -1590,7 +1945,7 @@ function showPersonPhotos(clusterId) {
       const div = document.createElement('div');
       div.className = 'year-divider';
       div.textContent = MONTH_NAMES[dt.getMonth()] + ' ' + dt.getFullYear();
-      photoGrid.appendChild(div);
+      frag.appendChild(div);
       lastYearMonth = ym;
     }
     const { wrap, cell } = createPersonPhotoWrap(personPhotos[i], i, clusterId);
@@ -1599,8 +1954,9 @@ function showPersonPhotos(clusterId) {
       needThumbPhotos.push(personPhotos[i]);
       needThumbCells.push(cell);
     }
-    photoGrid.appendChild(wrap);
+    frag.appendChild(wrap);
   }
+  photoGrid.appendChild(frag);
 
   displayCount = end;
   statusBar.textContent = `Showing ${end} of ${personPhotos.length} photos for ${cluster.name || 'Unknown Person'}`;
@@ -1619,10 +1975,172 @@ function showPersonPhotos(clusterId) {
   }
 }
 
+// ── New collection row for move modals ───────────────────────────────────
+function createNewCollectionRow(modal, bg, fromClusterId, photoPaths, onDone) {
+  const row = document.createElement('div');
+  row.className = 'reassign-person-row new-collection-row';
+
+  const icon = document.createElement('div');
+  icon.className = 'new-collection-icon';
+  icon.textContent = '+';
+  row.appendChild(icon);
+
+  const info = document.createElement('div');
+  info.innerHTML = '<div class="rp-name">New Collection</div><div class="rp-count">Create a new person collection</div>';
+  row.appendChild(info);
+
+  row.addEventListener('click', () => {
+    // Replace row content with name input
+    row.innerHTML = '';
+    row.classList.add('new-collection-input-row');
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'new-collection-input';
+    input.placeholder = 'Collection name (optional)';
+    row.appendChild(input);
+
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'btn-sm';
+    confirmBtn.style.cssText = 'padding:6px 14px;background:#0061fe;color:#fff;border-color:#0061fe;';
+    confirmBtn.textContent = 'Create';
+    confirmBtn.addEventListener('click', () => {
+      const name = input.value.trim();
+      const newCluster = FaceScan.createClusterFromPhotos(fromClusterId, photoPaths, name);
+      if (newCluster) {
+        bg.remove();
+        onDone(newCluster);
+        scheduleFaceDataSave();
+      }
+    });
+    row.appendChild(confirmBtn);
+
+    input.focus();
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); confirmBtn.click(); }
+      if (e.key === 'Escape') bg.remove();
+    });
+  });
+
+  const separator = document.createElement('div');
+  separator.className = 'reassign-separator';
+  modal.appendChild(row);
+  modal.appendChild(separator);
+}
+
+// ── Cluster list builder for modals (named first, search, limited unnamed) ──
+function buildClusterListInModal(modal, clusters, onSelect) {
+  const named = clusters.filter(c => c.name).sort((a, b) => a.name.localeCompare(b.name));
+  const unnamed = clusters.filter(c => !c.name);
+  const MAX_UNNAMED = 50;
+
+  // Search box
+  const searchInput = document.createElement('input');
+  searchInput.type = 'text';
+  searchInput.placeholder = 'Search collections\u2026';
+  searchInput.style.cssText = 'width:100%;padding:6px 10px;margin-bottom:8px;border:1px solid #444;border-radius:6px;background:#1a1a1a;color:#eee;font-size:13px;box-sizing:border-box;';
+  modal.appendChild(searchInput);
+
+  const listContainer = document.createElement('div');
+  modal.appendChild(listContainer);
+
+  function renderList(filter) {
+    listContainer.innerHTML = '';
+    const lc = (filter || '').toLowerCase();
+
+    const filteredNamed = lc ? named.filter(c => c.name.toLowerCase().includes(lc)) : named;
+    const filteredUnnamed = lc
+      ? unnamed.filter(c => c.id.toLowerCase().includes(lc))
+      : unnamed.slice(0, MAX_UNNAMED);
+
+    if (filteredNamed.length > 0) {
+      const label = document.createElement('div');
+      label.style.cssText = 'font-size:11px;color:#888;padding:4px 0 2px;text-transform:uppercase;letter-spacing:0.5px;';
+      label.textContent = 'Named Collections';
+      listContainer.appendChild(label);
+      for (const cluster of filteredNamed) {
+        listContainer.appendChild(makeClusterRow(cluster, onSelect));
+      }
+    }
+
+    if (filteredUnnamed.length > 0) {
+      const label = document.createElement('div');
+      label.style.cssText = 'font-size:11px;color:#888;padding:8px 0 2px;text-transform:uppercase;letter-spacing:0.5px;';
+      label.textContent = lc ? 'Unnamed Collections' : `Unnamed Collections (top ${MAX_UNNAMED})`;
+      listContainer.appendChild(label);
+      for (const cluster of filteredUnnamed) {
+        listContainer.appendChild(makeClusterRow(cluster, onSelect));
+      }
+    }
+
+    if (filteredNamed.length === 0 && filteredUnnamed.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'color:#666;padding:12px;text-align:center;';
+      empty.textContent = 'No matching collections';
+      listContainer.appendChild(empty);
+    }
+  }
+
+  function makeClusterRow(cluster, onClick) {
+    const row = document.createElement('div');
+    row.className = 'reassign-person-row';
+
+    const img = document.createElement('img');
+    const rThumb = getClusterThumb(cluster);
+    if (rThumb.thumb) img.src = rThumb.thumb;
+    row.appendChild(img);
+
+    const info = document.createElement('div');
+    info.innerHTML = `<div class="rp-name">${esc(cluster.name || 'Unknown')}</div><div class="rp-count">${cluster.photoCount} photos · ${cluster.id}</div>`;
+    row.appendChild(info);
+
+    row.addEventListener('click', () => onClick(cluster));
+    return row;
+  }
+
+  searchInput.addEventListener('input', () => renderList(searchInput.value));
+  renderList('');
+  setTimeout(() => searchInput.focus(), 50);
+}
+
+// ── Merge Into Modal (from person detail view) ──────────────────────────
+function showMergeIntoModal(currentClusterId) {
+  const clusters = FaceScan.getClusters().filter(c => c.id !== currentClusterId);
+  if (clusters.length === 0) { alert('No other collections to merge with.'); return; }
+
+  const bg = document.createElement('div');
+  bg.className = 'reassign-modal-bg';
+  bg.addEventListener('click', (e) => { if (e.target === bg) bg.remove(); });
+
+  const modal = document.createElement('div');
+  modal.className = 'reassign-modal';
+
+  const title = document.createElement('h3');
+  title.textContent = 'Merge another collection into this one\u2026';
+  modal.appendChild(title);
+
+  buildClusterListInModal(modal, clusters, (cluster) => {
+    if (!confirm(`Merge "${cluster.name || 'Unknown'}" (${cluster.photoCount} photos) into this collection? This will remove "${cluster.name || 'Unknown'}" as a separate collection.`)) return;
+    FaceScan.mergeClusters(currentClusterId, cluster.id);
+    bg.remove();
+    scheduleFaceDataSave();
+    showPersonPhotos(currentClusterId);
+  });
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn-people';
+  cancelBtn.style.cssText = 'margin-top:12px;width:100%;text-align:center;padding:8px;';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', () => bg.remove());
+  modal.appendChild(cancelBtn);
+
+  bg.appendChild(modal);
+  document.body.appendChild(bg);
+}
+
 // ── Reassign Photo Modal ─────────────────────────────────────────────────
 async function showReassignModal(fromClusterId, photoPath, photoWrapEl) {
   const clusters = FaceScan.getClusters().filter(c => c.id !== fromClusterId);
-  if (clusters.length === 0) return;
 
   const bg = document.createElement('div');
   bg.className = 'reassign-modal-bg';
@@ -1635,36 +2153,28 @@ async function showReassignModal(fromClusterId, photoPath, photoWrapEl) {
   title.textContent = 'Move photo to\u2026';
   modal.appendChild(title);
 
-  for (const cluster of clusters) {
-    const row = document.createElement('div');
-    row.className = 'reassign-person-row';
-
-    const img = document.createElement('img');
-    const rThumb = getClusterThumb(cluster);
-    if (rThumb) {
-      img.src = rThumb;
+  createNewCollectionRow(modal, bg, fromClusterId, [photoPath], () => {
+    photoWrapEl.remove();
+    syncAfterRemoval([photoPath]);
+    const updated = FaceScan.getClusters().find(c => c.id === fromClusterId);
+    if (updated) {
+      const sub = document.querySelector('.people-subtitle');
+      if (sub) sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 hover a photo for options`;
     }
-    row.appendChild(img);
+  });
 
-    const info = document.createElement('div');
-    info.innerHTML = `<div class="rp-name">${esc(cluster.name || 'Unknown')}</div><div class="rp-count">${cluster.photoCount} photos</div>`;
-    row.appendChild(info);
-
-    row.addEventListener('click', async () => {
-      FaceScan.movePhotoToCluster(fromClusterId, cluster.id, photoPath);
-      await FaceScan.saveFaceData(storage);
-      bg.remove();
-      photoWrapEl.remove();
-      // Update subtitle
-      const updated = FaceScan.getClusters().find(c => c.id === fromClusterId);
-      if (updated) {
-        const sub = document.querySelector('.people-subtitle');
-        if (sub) sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 hover a photo for options`;
-      }
-    });
-
-    modal.appendChild(row);
-  }
+  buildClusterListInModal(modal, clusters, async (cluster) => {
+    FaceScan.movePhotoToCluster(fromClusterId, cluster.id, photoPath);
+    bg.remove();
+    photoWrapEl.remove();
+    syncAfterRemoval([photoPath]);
+    const updated = FaceScan.getClusters().find(c => c.id === fromClusterId);
+    if (updated) {
+      const sub = document.querySelector('.people-subtitle');
+      if (sub) sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 hover a photo for options`;
+    }
+    scheduleFaceDataSave();
+  });
 
   // Cancel button
   const cancelBtn = document.createElement('button');
@@ -1681,7 +2191,6 @@ async function showReassignModal(fromClusterId, photoPath, photoWrapEl) {
 // ── Bulk Reassign Modal (multi-select) ───────────────────────────────────
 async function showBulkReassignModal(fromClusterId, photoPaths) {
   const clusters = FaceScan.getClusters().filter(c => c.id !== fromClusterId);
-  if (clusters.length === 0) return;
 
   const bg = document.createElement('div');
   bg.className = 'reassign-modal-bg';
@@ -1694,39 +2203,34 @@ async function showBulkReassignModal(fromClusterId, photoPaths) {
   title.textContent = `Move ${photoPaths.length} photo${photoPaths.length !== 1 ? 's' : ''} to\u2026`;
   modal.appendChild(title);
 
-  for (const cluster of clusters) {
-    const row = document.createElement('div');
-    row.className = 'reassign-person-row';
+  createNewCollectionRow(modal, bg, fromClusterId, photoPaths, () => {
+    document.querySelectorAll('.photo-cell-wrap.selected').forEach(w => w.remove());
+    selectedPhotoPaths.clear();
+    updateBulkActionBar();
+    syncAfterRemoval(photoPaths);
+    const updated = FaceScan.getClusters().find(c => c.id === fromClusterId);
+    const sub = document.querySelector('.people-subtitle');
+    if (updated && sub) {
+      sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
+    }
+  });
 
-    const img = document.createElement('img');
-    const rThumb = getClusterThumb(cluster);
-    if (rThumb) img.src = rThumb;
-    row.appendChild(img);
-
-    const info = document.createElement('div');
-    info.innerHTML = `<div class="rp-name">${esc(cluster.name || 'Unknown')}</div><div class="rp-count">${cluster.photoCount} photos</div>`;
-    row.appendChild(info);
-
-    row.addEventListener('click', async () => {
-      for (const p of photoPaths) {
-        FaceScan.movePhotoToCluster(fromClusterId, cluster.id, p);
-      }
-      await FaceScan.saveFaceData(storage);
-      bg.remove();
-      // Remove selected DOM elements
-      document.querySelectorAll('.photo-cell-wrap.selected').forEach(w => w.remove());
-      selectedPhotoPaths.clear();
-      updateBulkActionBar();
-      // Update subtitle
-      const updated = FaceScan.getClusters().find(c => c.id === fromClusterId);
-      const sub = document.querySelector('.people-subtitle');
-      if (updated && sub) {
-        sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
-      }
-    });
-
-    modal.appendChild(row);
-  }
+  buildClusterListInModal(modal, clusters, async (cluster) => {
+    for (const p of photoPaths) {
+      FaceScan.movePhotoToCluster(fromClusterId, cluster.id, p);
+    }
+    bg.remove();
+    document.querySelectorAll('.photo-cell-wrap.selected').forEach(w => w.remove());
+    selectedPhotoPaths.clear();
+    updateBulkActionBar();
+    syncAfterRemoval(photoPaths);
+    const updated = FaceScan.getClusters().find(c => c.id === fromClusterId);
+    const sub = document.querySelector('.people-subtitle');
+    if (updated && sub) {
+      sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
+    }
+    scheduleFaceDataSave();
+  });
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'btn-people';
@@ -1802,13 +2306,14 @@ function startRenameCluster(card, clusterId, nameEl) {
   input.focus();
   input.select();
 
-  const finish = async () => {
+  const finish = () => {
     const newName = input.value.trim();
     FaceScan.renameCluster(clusterId, newName);
-    await FaceScan.saveFaceData(storage);
     nameEl.textContent = newName || 'Unknown';
     nameEl.style.display = '';
     input.remove();
+    card.classList.toggle('named', !!newName);
+    FaceScan.saveFaceData(storage);
   };
 
   input.addEventListener('blur', finish);
