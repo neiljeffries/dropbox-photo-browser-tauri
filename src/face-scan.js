@@ -1358,6 +1358,74 @@ const FaceScan = (() => {
     return { scanned, faces: facesFound };
   }
 
+  /**
+   * Rescan and recluster all clusters with fewer than `maxPhotos` photos.
+   * Clears their face data, re-downloads and re-detects, removes the old
+   * clusters, then runs incremental clustering so faces land in the best
+   * matching cluster (named clusters get priority via NAMED_BOOST).
+   */
+  async function rescanSmallClusters(maxPhotos, progressCb) {
+    const smallClusters = faceData.clusters.filter(c => c.photoCount < maxPhotos && !c.name);
+    if (smallClusters.length === 0) return { clusters: 0, scanned: 0, faces: 0 };
+
+    await loadModels();
+
+    // Collect all unique photo paths across the small clusters
+    const pathSet = new Set();
+    for (const c of smallClusters) {
+      for (const p of c.photos) pathSet.add(p);
+    }
+    const allPaths = [...pathSet];
+
+    let scanned = 0, facesFound = 0;
+    const totalPhotos = allPaths.length;
+
+    // Phase 1: Re-scan all photos from the small clusters
+    for (const path of allPaths) {
+      delete faceData.photos[path];
+      delete _serializedPhotos[path];
+
+      let faces;
+      try {
+        if (_imageDownloader) {
+          faces = await scanPhotoFullRes(path);
+        } else {
+          faceData.photos[path] = [];
+          _dirtyPhotos.add(path);
+          faces = [];
+        }
+      } catch (e) {
+        if (e.status === 401 || e.status === 403) {
+          console.error('[rescanSmall] Auth error — aborting.');
+          break;
+        }
+        console.warn('[rescanSmall] Error scanning', path, e.message);
+        faceData.photos[path] = [];
+        _dirtyPhotos.add(path);
+        faces = [];
+      }
+
+      scanned++;
+      facesFound += faces.length;
+      if (progressCb) progressCb(scanned, totalPhotos, facesFound);
+      await new Promise(r => setTimeout(r, 30));
+    }
+
+    // Phase 2: Remove the small clusters so their photos become "unassigned"
+    const smallIds = new Set(smallClusters.map(c => c.id));
+    faceData.clusters = faceData.clusters.filter(c => !smallIds.has(c.id));
+
+    // Phase 3: Incremental cluster will pick up unassigned photos and match
+    // them to named/larger clusters first (NAMED_BOOST), then form new clusters
+    await incrementalCluster();
+
+    if (_storageAdapter) {
+      await saveFaceData(_storageAdapter);
+    }
+
+    return { clusters: smallClusters.length, scanned, faces: facesFound };
+  }
+
   return {
     loadModels,
     loadFaceData,
@@ -1387,6 +1455,7 @@ const FaceScan = (() => {
     createClusterFromPhotos,
     reclusterCollection,
     rescanCollection,
+    rescanSmallClusters,
     setClusterPoster,
   };
 })();

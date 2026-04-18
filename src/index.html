@@ -233,6 +233,13 @@
     cursor: pointer; padding: 4px 8px;
   }
   #lightbox-close:hover { color: #fff; }
+  #lightbox-download {
+    position: absolute; top: 10px; right: 48px;
+    background: none; border: none; color: #666; font-size: 18px;
+    cursor: pointer; padding: 4px 8px;
+  }
+  #lightbox-download:hover { color: #fff; }
+  #lightbox-download:disabled { opacity: 0.5; cursor: default; }
   #lightbox-prev, #lightbox-next {
     position: absolute; top: 50%; transform: translateY(-50%);
     background: rgba(255,255,255,0.07); border: none; border-radius: 50%;
@@ -403,6 +410,30 @@
     border-color: rgba(255, 185, 0, 0.55);
   }
 
+  /* ── singles group card ── */
+  .singles-card .singles-mosaic {
+    width: 140px; height: 140px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 1px;
+    background: #1a1a1c;
+  }
+  .singles-card .singles-mosaic img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .singles-card {
+    border-color: #333;
+  }
+  .singles-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px 16px;
+  }
+
   /* ── merge mode ── */
   .person-card.selected {
     border-color: #0061fe;
@@ -478,6 +509,8 @@
   .bulk-action-bar .bulk-btn.danger:hover { background: rgba(200,0,0,0.3); }
   .bulk-action-bar .bulk-btn.primary { border-color: #0061fe; color: #4d9aff; }
   .bulk-action-bar .bulk-btn.primary:hover { background: rgba(0,97,254,0.2); }
+  .bulk-action-bar .bulk-btn.download { border-color: #2e7d32; color: #66bb6a; }
+  .bulk-action-bar .bulk-btn.download:hover { background: rgba(46,125,50,0.25); }
   .bulk-action-bar .bulk-spacer { flex: 1; }
 
   /* ── reassign modal ── */
@@ -537,6 +570,78 @@
     pointer-events: none;
     transition: opacity 0.3s;
   }
+
+  /* ── people timeline view ── */
+  #timeline-view {
+    display: none;
+    padding: 16px;
+  }
+  #timeline-view.visible { display: block; }
+  .timeline-controls {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 20px; flex-wrap: wrap;
+  }
+  .timeline-controls label {
+    font-size: 12px; color: #888;
+  }
+  .timeline-controls select,
+  .timeline-controls input[type="range"] {
+    background: #1a1a1c; border: 1px solid #2a2a2c; border-radius: 6px;
+    color: #e8e6e0; font-size: 12px; padding: 5px 10px;
+    cursor: pointer; outline: none;
+  }
+  .timeline-controls select:focus,
+  .timeline-controls input[type="range"]:focus { border-color: #0061fe; }
+  .timeline-controls select { min-width: 180px; }
+  .timeline-controls input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    width: 120px; height: 4px; border-radius: 2px;
+    background: #222; padding: 0;
+  }
+  .timeline-controls input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #0061fe; border: 2px solid #0f0f10;
+    cursor: pointer;
+  }
+  .timeline-size-label {
+    font-size: 11px; color: #666; min-width: 40px;
+  }
+  .timeline-year-group {
+    margin-bottom: 24px;
+  }
+  .timeline-year-label {
+    font-size: 28px; font-weight: 700; color: #fff;
+    margin-bottom: 12px; padding-bottom: 4px;
+    border-bottom: 2px solid #222;
+  }
+  .timeline-months {
+    display: flex; flex-wrap: wrap; gap: 10px;
+  }
+  .timeline-month-card {
+    display: flex; flex-direction: column; align-items: center;
+    background: #141416; border-radius: 8px;
+    overflow: hidden; cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+    border: 1px solid #1e1e20;
+  }
+  .timeline-month-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    border-color: #333;
+  }
+  .timeline-month-card img {
+    display: block; object-fit: cover;
+    background: #1a1a1c;
+  }
+  .timeline-month-card .month-label {
+    font-size: 11px; font-weight: 600; color: #ccc;
+    padding: 6px 8px; text-align: center; width: 100%;
+    background: #111;
+  }
+  .timeline-empty {
+    font-size: 13px; color: #555; padding: 40px; text-align: center;
+  }
 </style>
 </head>
 <body>
@@ -555,7 +660,7 @@
   </div>
   <div id="save-indicator"><span class="save-dot"></span>Saving…</div>
   <button id="btn-save" title="Save now (resets auto-save timer)">💾 Save</button>
-  <span class="version-info">v0.5.2</span>
+  <span class="version-info">v0.5.4</span>
   <div style="display:flex;gap:4px">
     <button class="btn-icon" id="btn-logout" title="Disconnect" style="display:none">⏻</button>
   </div>
@@ -565,6 +670,7 @@
 <div class="toolbar" id="toolbar" style="display:none">
   <div class="path-breadcrumb" id="path-display">/ <span data-path="">Home</span></div>
   <button class="btn-people" id="btn-people" title="Browse by person">👤 People</button>
+  <button class="btn-people" id="btn-timeline" title="People timelines">📅 Timeline</button>
   <button class="btn-sm" id="btn-scan" title="Re-scan folder from Dropbox">⟳ Scan Now</button>
   <button class="btn-sm" id="btn-clear-cache" title="Clear all cached data">✖ Clear Cache</button>
   <button class="btn-sm" id="btn-up" style="display:none">↑ Up</button>
@@ -625,6 +731,9 @@
 <!-- People view -->
 <div id="people-view"></div>
 
+<!-- People Timeline view -->
+<div id="timeline-view"></div>
+
 <!-- Photo grid -->
 <div id="photo-grid"></div>
 
@@ -637,6 +746,7 @@
 <!-- Lightbox -->
 <div id="lightbox">
   <button id="lightbox-close">✕</button>
+  <button id="lightbox-download" title="Download full size">⬇</button>
   <img id="lightbox-img" src="" alt="" />
   <video id="lightbox-vid" controls style="display:none"></video>
   <div id="lightbox-name"></div>

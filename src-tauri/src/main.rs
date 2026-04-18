@@ -168,6 +168,121 @@ async fn oauth_listen(port: u16) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+#[tauri::command]
+async fn download_single_file(
+    dropbox_path: String,
+    filename: String,
+    access_token: String,
+) -> Result<bool, String> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_file_name(&filename)
+        .save_file()
+        .await;
+    let save_path = match dialog {
+        Some(handle) => handle.path().to_path_buf(),
+        None => return Ok(false),
+    };
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://content.dropboxapi.com/2/files/download")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header(
+            "Dropbox-API-Arg",
+            serde_json::json!({ "path": dropbox_path }).to_string(),
+        )
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("Dropbox API error: {}", res.status()));
+    }
+    let bytes = res.bytes().await.map_err(|e| format!("Read failed: {}", e))?;
+    tokio::fs::write(&save_path, &bytes)
+        .await
+        .map_err(|e| format!("Save failed: {}", e))?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn download_files_zip(
+    dropbox_paths: Vec<String>,
+    filenames: Vec<String>,
+    access_token: String,
+    zip_name: String,
+) -> Result<bool, String> {
+    use std::io::Write;
+
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_file_name(&zip_name)
+        .add_filter("ZIP Archive", &["zip"])
+        .save_file()
+        .await;
+    let save_path = match dialog {
+        Some(handle) => handle.path().to_path_buf(),
+        None => return Ok(false),
+    };
+
+    let file = std::fs::File::create(&save_path)
+        .map_err(|e| format!("Cannot create file: {}", e))?;
+    let mut zip_writer = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    let client = reqwest::Client::new();
+
+    // Deduplicate filenames
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    let mut unique_names: Vec<String> = Vec::with_capacity(filenames.len());
+    for name in &filenames {
+        let count = name_counts.entry(name.to_lowercase()).or_insert(0);
+        if *count == 0 {
+            unique_names.push(name.clone());
+        } else {
+            let dot_pos = name.rfind('.');
+            let unique = if let Some(pos) = dot_pos {
+                format!("{} ({}){}", &name[..pos], count, &name[pos..])
+            } else {
+                format!("{} ({})", name, count)
+            };
+            unique_names.push(unique);
+        }
+        *count += 1;
+    }
+
+    for (i, dbx_path) in dropbox_paths.iter().enumerate() {
+        let fname = &unique_names[i];
+        let res = client
+            .post("https://content.dropboxapi.com/2/files/download")
+            .header("Authorization", format!("Bearer {}", &access_token))
+            .header(
+                "Dropbox-API-Arg",
+                serde_json::json!({ "path": dbx_path }).to_string(),
+            )
+            .send()
+            .await
+            .map_err(|e| format!("Download failed for {}: {}", fname, e))?;
+        if !res.status().is_success() {
+            drop(zip_writer);
+            std::fs::remove_file(&save_path).ok();
+            return Err(format!("Dropbox error for {}: {}", fname, res.status()));
+        }
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| format!("Read failed for {}: {}", fname, e))?;
+        zip_writer
+            .start_file(fname, options)
+            .map_err(|e| format!("Zip error: {}", e))?;
+        zip_writer
+            .write_all(&bytes)
+            .map_err(|e| format!("Zip write error: {}", e))?;
+    }
+
+    zip_writer
+        .finish()
+        .map_err(|e| format!("Zip finish error: {}", e))?;
+    Ok(true)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -181,7 +296,9 @@ fn main() {
             store_keys,
             store_clear_cache,
             store_get_all,
-            oauth_listen
+            oauth_listen,
+            download_single_file,
+            download_files_zip
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
