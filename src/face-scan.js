@@ -42,7 +42,7 @@ const FaceScan = (() => {
   let scanAbort = false;
   let _imageDownloader = null;
   let _storageAdapter = null;
-  let _serializedPhotos = {};  // Cache of already-serialized photo entries
+  let _serializedPhotos = {};  // Cache of per-photo JSON strings for fast assembly
   let _dirtyPhotos = new Set(); // Photos needing re-serialization
 
   // ── Model Loading ──────────────────────────────────────────────────────────
@@ -76,16 +76,15 @@ const FaceScan = (() => {
     const stored = await storageAdapter.get([FACE_DATA_KEY]);
     if (stored[FACE_DATA_KEY]) {
       faceData = stored[FACE_DATA_KEY];
-      // Rebuild _serializedPhotos from stored data so subsequent saves don't
-      // wipe already-scanned entries (only _dirtyPhotos get re-serialized).
+      // Rebuild _serializedPhotos as pre-built JSON strings so subsequent
+      // saves only need string concatenation, not full JSON.stringify.
       _serializedPhotos = {};
       for (const path in faceData.photos) {
-        // Keep the raw stored form (Array descriptors) for serialization cache
-        _serializedPhotos[path] = faceData.photos[path].map(f => ({
+        _serializedPhotos[path] = JSON.stringify(faceData.photos[path].map(f => ({
           box: f.box,
           descriptor: Array.isArray(f.descriptor) ? f.descriptor : Array.from(f.descriptor),
           score: f.score,
-        }));
+        })));
         // Convert descriptors to Float32Array for in-memory use
         for (const face of faceData.photos[path]) {
           if (face.descriptor && !(face.descriptor instanceof Float32Array)) {
@@ -128,29 +127,46 @@ const FaceScan = (() => {
   }
 
   async function saveFaceData(storageAdapter) {
-    // Incrementally serialize only new/changed photos
+    // Incrementally stringify only new/changed photos (each is small → fast)
     for (const path of _dirtyPhotos) {
-      _serializedPhotos[path] = faceData.photos[path].map(f => ({
+      _serializedPhotos[path] = JSON.stringify(faceData.photos[path].map(f => ({
         box: f.box,
         descriptor: Array.from(f.descriptor),
         score: f.score,
-      }));
+      })));
     }
     _dirtyPhotos.clear();
     // Remove any photos deleted from faceData
     for (const path in _serializedPhotos) {
       if (!(path in faceData.photos)) delete _serializedPhotos[path];
     }
-    const serializable = {
-      version: faceData.version,
-      photos: _serializedPhotos,
-      clusters: faceData.clusters,
-      exclusions: faceData.exclusions || [],
-      legacyNames: faceData.legacyNames || null,
-    };
-    // Yield to UI before the IPC call
+
+    // Assemble the full JSON via string concatenation — avoids JSON.stringify
+    // on the massive photos map entirely.  Clusters/exclusions are small and
+    // safe to stringify inline.
+    const photoPaths = Object.keys(_serializedPhotos);
+    const photoChunks = [];
+    for (let i = 0; i < photoPaths.length; i++) {
+      photoChunks.push(JSON.stringify(photoPaths[i]) + ':' + _serializedPhotos[photoPaths[i]]);
+      // Yield every 500 entries so the browser can process scroll/paint events
+      if (i > 0 && i % 500 === 0) await new Promise(r => setTimeout(r, 0));
+    }
+
+    const json = '{"version":' + faceData.version
+      + ',"photos":{' + photoChunks.join(',') + '}'
+      + ',"clusters":' + JSON.stringify(faceData.clusters)
+      + ',"exclusions":' + JSON.stringify(faceData.exclusions || [])
+      + ',"legacyNames":' + JSON.stringify(faceData.legacyNames || null)
+      + '}';
+
+    // Yield before the IPC call
     await new Promise(r => setTimeout(r, 0));
-    await storageAdapter.set({ [FACE_DATA_KEY]: serializable });
+
+    if (storageAdapter.setRaw) {
+      await storageAdapter.setRaw(FACE_DATA_KEY, json);
+    } else {
+      await storageAdapter.set({ [FACE_DATA_KEY]: JSON.parse(json) });
+    }
   }
 
   // ── Image Downloader ───────────────────────────────────────────────────────
@@ -569,6 +585,13 @@ const FaceScan = (() => {
       return;
     }
 
+    // Build exclusion map so manual removals survive rebuild
+    const exclusionMap = new Map();
+    for (const ex of (faceData.exclusions || [])) {
+      if (!exclusionMap.has(ex.photoPath)) exclusionMap.set(ex.photoPath, new Set());
+      exclusionMap.get(ex.photoPath).add(ex.clusterId);
+    }
+
     const n = allFaces.length;
     const neighbors = new Array(n);
     for (let i = 0; i < n; i++) neighbors[i] = [];
@@ -675,8 +698,22 @@ const FaceScan = (() => {
       });
     }
 
+    // Enforce exclusions — remove photos that the user manually removed from
+    // their matched cluster.  This prevents "removed photos reappearing".
+    for (const cluster of clusters) {
+      const before = cluster.photos.length;
+      cluster.photos = cluster.photos.filter(p => {
+        const excluded = exclusionMap.get(p);
+        return !(excluded && excluded.has(cluster.id));
+      });
+      cluster.photoCount = cluster.photos.length;
+      if (cluster.photos.length < before) {
+        console.log(`[rebuildClusters] Enforced ${before - cluster.photos.length} exclusion(s) on cluster "${cluster.name || cluster.id}"`);
+      }
+    }
     clusters.sort((a, b) => b.photoCount - a.photoCount);
-    faceData.clusters = clusters;
+    // Drop clusters that became empty after exclusion enforcement
+    faceData.clusters = clusters.filter(c => c.photoCount > 0);
   }
 
   function recalcClusterCentroid(cluster) {

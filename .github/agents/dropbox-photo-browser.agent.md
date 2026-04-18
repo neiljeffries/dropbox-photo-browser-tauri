@@ -33,6 +33,32 @@ This is a single-window desktop app with a Rust/Tauri backend and vanilla HTML/C
   2. Second request: receives the actual token params from the JS fetch
 - Uses `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` to hide console in release builds
 
+### Data Persistence (store.json)
+
+All app data is saved to a single JSON file at `%LOCALAPPDATA%\dropbox-photo-browser\store.json` (i.e. `C:\Users\<user>\AppData\Local\dropbox-photo-browser\store.json`). The Rust `AppStore` reads it on startup and writes it asynchronously via `persist_async()` on a background thread after each mutation.
+
+**Storage keys:**
+
+| Key | Contents |
+|-----|----------|
+| `faceDataStore_v3` | All face/people data: `photos` (path → array of `{ box, descriptor, score }` with 512-dim ArcFace embeddings), `clusters` (id, name, samplePhoto, sampleBox, sampleDescriptor, photoCount, photos array), `exclusions` (manual removals), `legacyNames` (v2 migration) |
+| `thumbCache` | Thumbnail cache — base64 data-URI strings keyed by Dropbox file path (small `w128h128` previews). Dirty-flag + 3-minute debounce timer before persisting. |
+| `appKey` | Dropbox OAuth app key |
+| `accessToken` / `refreshToken` | Dropbox OAuth 2 tokens |
+| `photos_{folderPath}` | Cached Dropbox folder listing per root path — `{ entries: [...], timestamp }`. Entries contain file metadata (name, path, size, dates, media_info) but NOT image data. |
+
+**What is NOT saved locally:**
+- Full-resolution photos — always fetched on-demand from Dropbox `files/download` API
+- Video files — streamed from Dropbox API each time
+- Upgraded thumbnails (larger than w128h128) — only the small default thumbnails are cached
+
+**Face data specifics (`faceDataStore_v3`):**
+- `photos`: Map of `photoPath → [{ box: {x,y,width,height}, descriptor: Float32Array(512), score: number }]`
+- `clusters`: Array of `{ id, name, samplePhoto, sampleBox, sampleDescriptor, photoCount, photos: [paths] }`
+- Descriptors are stored as plain arrays in JSON and converted to `Float32Array` on load
+- Incremental serialization: only `_dirtyPhotos` are re-serialized on save via `_serializedPhotos` cache
+- V2→V3 migration preserves cluster names but clears incompatible 128-dim descriptors (rescan required)
+
 ### Frontend (app.js)
 
 - **Constants**: `THUMB_SIZE = 'w128h128'`, `DISPLAY_PAGE = 250`, `OAUTH_PORT = 17822`

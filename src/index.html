@@ -83,21 +83,43 @@
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.4; transform: scale(0.75); }
   }
-  #btn-save {
-    background: none; border: 1px solid #333; cursor: pointer;
-    color: #888; font-size: 11px; padding: 2px 8px;
-    border-radius: 4px; transition: background 0.15s, color 0.15s, border-color 0.15s;
-    white-space: nowrap;
-  }
-  #btn-save:hover { background: #1e1e20; color: #e8e6e0; border-color: #555; }
-  #btn-save:active { background: #0061fe; color: #fff; border-color: #0061fe; }
-  #btn-save.saved { color: #4caf50; border-color: #4caf50; }
   .btn-icon {
     background: none; border: none; cursor: pointer;
     color: #888; font-size: 16px; padding: 4px 6px;
     border-radius: 6px; transition: background 0.15s, color 0.15s;
   }
   .btn-icon:hover { background: #1e1e20; color: #e8e6e0; }
+
+  /* ── file menu ── */
+  .file-menu-wrap { position: relative; margin-left: 12px; }
+  .file-menu-btn {
+    background: none; border: 1px solid #333; cursor: pointer;
+    color: #888; font-size: 11px; padding: 2px 8px;
+    border-radius: 4px; transition: background 0.15s, color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .file-menu-btn:hover { background: #1e1e20; color: #e8e6e0; border-color: #555; }
+  .file-menu-btn.open { background: #1e1e20; color: #e8e6e0; border-color: #555; }
+  .file-menu-dropdown {
+    display: none; position: absolute; top: calc(100% + 4px); left: 0;
+    min-width: 180px; background: #1a1a1c; border: 1px solid #2a2a2c;
+    border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    z-index: 200; padding: 4px 0; opacity: 0; transform: translateY(-4px);
+    transition: opacity 0.15s, transform 0.15s;
+  }
+  .file-menu-dropdown.open { display: block; opacity: 1; transform: translateY(0); }
+  .file-menu-dropdown button {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    background: none; border: none; color: #ccc; font-size: 12px;
+    padding: 7px 14px; cursor: pointer; text-align: left;
+    transition: background 0.1s;
+  }
+  .file-menu-dropdown button:hover { background: #0061fe; color: #fff; }
+  .file-menu-dropdown button:disabled { color: #555; cursor: default; }
+  .file-menu-dropdown button:disabled:hover { background: none; color: #555; }
+  .file-menu-dropdown .menu-sep {
+    height: 1px; background: #2a2a2c; margin: 4px 10px;
+  }
 
   /* ── toolbar ── */
   .toolbar {
@@ -168,12 +190,12 @@
   /* ── photo grid ── */
   #photo-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, 120px);
+    grid-template-columns: repeat(auto-fill, var(--cell-size, 120px));
     gap: 2px;
     padding: 2px;
   }
   .photo-cell {
-    width: 120px; height: 120px;
+    width: var(--cell-size, 120px); height: var(--cell-size, 120px);
     background: #141416;
     overflow: hidden;
     cursor: pointer;
@@ -228,18 +250,48 @@
     text-align: center; font-size: 12px; color: #666;
   }
   #lightbox-close {
-    position: absolute; top: 10px; right: 12px;
+    position: absolute; top: 10px; right: 12px; z-index: 5;
     background: none; border: none; color: #666; font-size: 22px;
     cursor: pointer; padding: 4px 8px;
   }
   #lightbox-close:hover { color: #fff; }
   #lightbox-download {
-    position: absolute; top: 10px; right: 48px;
+    position: absolute; top: 10px; right: 48px; z-index: 5;
     background: none; border: none; color: #666; font-size: 18px;
     cursor: pointer; padding: 4px 8px;
   }
   #lightbox-download:hover { color: #fff; }
   #lightbox-download:disabled { opacity: 0.5; cursor: default; }
+  #lightbox-info-btn {
+    position: absolute; top: 10px; right: 84px; z-index: 5;
+    background: none; border: none; color: #666; font-size: 18px;
+    cursor: pointer; padding: 4px 8px;
+  }
+  #lightbox-info-btn:hover { color: #fff; }
+  #lightbox-info-btn.active { color: #0061fe; }
+  #lightbox-info-panel {
+    display: none; position: absolute; top: 0; right: 0; bottom: 0;
+    width: 320px; background: #141416; border-left: 1px solid #2a2a2c;
+    overflow-y: auto; z-index: 2; padding: 48px 16px 16px;
+    font-size: 12px; color: #ccc;
+  }
+  #lightbox-info-panel.open { display: block; }
+  #lightbox-info-panel .info-panel-close {
+    position: absolute; top: 10px; right: 10px;
+    background: none; border: none; color: #666; font-size: 18px;
+    cursor: pointer; padding: 2px 6px;
+  }
+  #lightbox-info-panel .info-panel-close:hover { color: #fff; }
+  #lightbox-info-panel h3 {
+    font-size: 13px; color: #e8e6e0; margin: 16px 0 8px; font-weight: 600;
+  }
+  #lightbox-info-panel h3:first-child { margin-top: 0; }
+  .info-row {
+    display: flex; justify-content: space-between; padding: 4px 0;
+    border-bottom: 1px solid #1e1e20;
+  }
+  .info-row .info-label { color: #888; }
+  .info-row .info-value { color: #e8e6e0; text-align: right; max-width: 60%; word-break: break-all; }
   #lightbox-prev, #lightbox-next {
     position: absolute; top: 50%; transform: translateY(-50%);
     background: rgba(255,255,255,0.07); border: none; border-radius: 50%;
@@ -247,8 +299,8 @@
     cursor: pointer; display: flex; align-items: center; justify-content: center;
     transition: background 0.15s;
   }
-  #lightbox-prev { left: 10px; }
-  #lightbox-next { right: 10px; }
+  #lightbox-prev { left: 10px; z-index: 5; }
+  #lightbox-next { right: 10px; z-index: 5; }
   #lightbox-prev:hover, #lightbox-next:hover { background: rgba(255,255,255,0.14); color: #fff; }
 
   /* ── status bar ── */
@@ -343,7 +395,7 @@
   #people-view.visible { display: block; }
   .people-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, 140px);
+    grid-template-columns: repeat(auto-fill, var(--people-thumb-size, 140px));
     gap: 12px;
   }
   .person-card {
@@ -360,7 +412,7 @@
     border-color: #333;
   }
   .person-card .face-thumb {
-    width: 140px; height: 140px;
+    width: var(--people-thumb-size, 140px); height: var(--people-thumb-size, 140px);
     object-fit: cover;
     display: block;
     background: #1a1a1c;
@@ -400,6 +452,29 @@
   }
   .people-back:hover { background: #222224; color: #e8e6e0; }
 
+  /* ── size slider (shared by people grid, cluster detail, timeline) ── */
+  .size-slider-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px; border-bottom: 1px solid #1a1a1c;
+    background: #0f0f10;
+  }
+  .size-slider-row label {
+    font-size: 11px; color: #888; white-space: nowrap;
+  }
+  .size-slider-row input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    width: 120px; height: 4px; border-radius: 2px;
+    background: #222; outline: none; cursor: pointer;
+  }
+  .size-slider-row input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #0061fe; border: 2px solid #0f0f10; cursor: pointer;
+  }
+  .size-slider-row .size-value {
+    font-size: 11px; color: #666; min-width: 36px;
+  }
+
   /* ── named collection glow ── */
   .person-card.named {
     box-shadow: 0 0 6px 2px rgba(255, 185, 0, 0.3);
@@ -412,7 +487,7 @@
 
   /* ── singles group card ── */
   .singles-card .singles-mosaic {
-    width: 140px; height: 140px;
+    width: var(--people-thumb-size, 140px); height: var(--people-thumb-size, 140px);
     display: grid;
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 1fr 1fr;
@@ -659,7 +734,17 @@
     </div>
   </div>
   <div id="save-indicator"><span class="save-dot"></span>Saving…</div>
-  <button id="btn-save" title="Save now (resets auto-save timer)">💾 Save</button>
+  <div class="file-menu-wrap">
+    <button class="file-menu-btn" id="file-menu-btn">File ▾</button>
+    <div class="file-menu-dropdown" id="file-menu-dropdown">
+      <button id="btn-save">💾 Save Now</button>
+      <div class="menu-sep"></div>
+      <button id="menu-export">📤 Export Backup</button>
+      <button id="menu-import">📥 Import Backup</button>
+      <div class="menu-sep"></div>
+      <button id="menu-export-thumbs">🖼️ Export Thumbnails Only</button>
+    </div>
+  </div>
   <span class="version-info">v0.5.4</span>
   <div style="display:flex;gap:4px">
     <button class="btn-icon" id="btn-logout" title="Disconnect" style="display:none">⏻</button>
@@ -746,12 +831,14 @@
 <!-- Lightbox -->
 <div id="lightbox">
   <button id="lightbox-close">✕</button>
+  <button id="lightbox-info-btn" title="Photo info">ℹ</button>
   <button id="lightbox-download" title="Download full size">⬇</button>
   <img id="lightbox-img" src="" alt="" />
   <video id="lightbox-vid" controls style="display:none"></video>
   <div id="lightbox-name"></div>
   <button id="lightbox-prev">‹</button>
   <button id="lightbox-next">›</button>
+  <div id="lightbox-info-panel"></div>
 </div>
 
 <button id="btn-top" title="Back to top">↑ Top</button>

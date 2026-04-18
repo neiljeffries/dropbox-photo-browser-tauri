@@ -101,6 +101,19 @@ fn store_keys(store: State<'_, Arc<AppStore>>) -> Vec<String> {
     data.keys().cloned().collect()
 }
 
+/// Accept a key + pre-serialized JSON string so the frontend can offload
+/// JSON.stringify to a Web Worker and keep the UI thread free.
+#[tauri::command]
+fn store_set_raw(key: String, json: String, store: State<'_, Arc<AppStore>>) -> Result<(), String> {
+    let value: Value = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    {
+        let mut data = store.data.lock().unwrap();
+        data.insert(key, value);
+    }
+    store.inner().persist_async();
+    Ok(())
+}
+
 #[tauri::command]
 fn store_clear_cache(prefix: String, thumb_key: String, store: State<'_, Arc<AppStore>>) {
     {
@@ -283,6 +296,39 @@ async fn download_files_zip(
     Ok(true)
 }
 
+#[tauri::command]
+async fn export_data(json_data: String) -> Result<bool, String> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_file_name("dropbox-photo-browser-backup.json")
+        .add_filter("JSON Backup", &["json"])
+        .save_file()
+        .await;
+    let save_path = match dialog {
+        Some(handle) => handle.path().to_path_buf(),
+        None => return Ok(false),
+    };
+    tokio::fs::write(&save_path, json_data.as_bytes())
+        .await
+        .map_err(|e| format!("Export failed: {}", e))?;
+    Ok(true)
+}
+
+#[tauri::command]
+async fn import_data() -> Result<Option<String>, String> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .add_filter("JSON Backup", &["json"])
+        .pick_file()
+        .await;
+    let file_path = match dialog {
+        Some(handle) => handle.path().to_path_buf(),
+        None => return Ok(None),
+    };
+    let contents = tokio::fs::read_to_string(&file_path)
+        .await
+        .map_err(|e| format!("Import read failed: {}", e))?;
+    Ok(Some(contents))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -292,13 +338,16 @@ fn main() {
             store_get_batch,
             store_set,
             store_set_batch,
+            store_set_raw,
             store_remove,
             store_keys,
             store_clear_cache,
             store_get_all,
             oauth_listen,
             download_single_file,
-            download_files_zip
+            download_files_zip,
+            export_data,
+            import_data
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

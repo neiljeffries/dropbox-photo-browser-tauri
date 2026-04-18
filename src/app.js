@@ -84,6 +84,15 @@ const storage = {
       hideSaveIndicator();
     }
   },
+  /** Save a pre-built JSON string directly — skips JS-side JSON.stringify. */
+  async setRaw(key, json) {
+    showSaveIndicator();
+    try {
+      await invoke('store_set_raw', { key, json });
+    } finally {
+      hideSaveIndicator();
+    }
+  },
   async remove(keys) {
     if (typeof keys === 'string') keys = [keys];
     await invoke('store_remove', { keys });
@@ -157,29 +166,39 @@ async function loadThumbCache() {
 function scheduleThumbSave() {
   thumbCacheDirty = true;
   if (thumbSaveTimer) clearTimeout(thumbSaveTimer);
-  thumbSaveTimer = setTimeout(async () => {
+  thumbSaveTimer = setTimeout(() => {
     thumbSaveTimer = null;
-    if (thumbCacheDirty) {
+    if (!thumbCacheDirty) return;
+    // Wait for browser idle so scroll/paint are not blocked
+    requestIdleCallback(() => {
+      if (!thumbCacheDirty) return;
       thumbCacheDirty = false;
-      await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
-    }
+      const json = JSON.stringify(thumbCache);
+      storage.setRaw(THUMB_CACHE_KEY, json);
+    });
   }, 180000);
 }
 
-// ── Debounced face-data save (avoids multi-second IPC serialization on every action) ──
+// ── Debounced face-data save ──────────────────────────────────────────────────
 let _faceSaveTimer = null;
+let _faceSaveIdleCb = null;
 let _faceSaveInProgress = false;
 let _faceSavePendingAgain = false;
 
-function scheduleFaceDataSave() {
-  if (_faceSaveTimer) clearTimeout(_faceSaveTimer);
+function scheduleFaceDataSave(immediate) {
+  if (_faceSaveTimer) { clearTimeout(_faceSaveTimer); _faceSaveTimer = null; }
+  if (_faceSaveIdleCb) { cancelIdleCallback(_faceSaveIdleCb); _faceSaveIdleCb = null; }
   // If a save is already in flight, just flag that we need another round
   if (_faceSaveInProgress) { _faceSavePendingAgain = true; return; }
+  const delay = immediate ? 300 : 180000;
   _faceSaveTimer = setTimeout(() => {
     _faceSaveTimer = null;
-    // Wait for idle so we don't block the user mid-click
-    (typeof requestIdleCallback === 'function' ? requestIdleCallback : setTimeout)(() => _doFaceSave());
-  }, 180000);
+    // Wait for browser idle so save never interrupts scroll/paint
+    _faceSaveIdleCb = requestIdleCallback(() => {
+      _faceSaveIdleCb = null;
+      _doFaceSave();
+    }, { timeout: immediate ? 2000 : 30000 });
+  }, delay);
 }
 
 async function _doFaceSave() {
@@ -196,31 +215,166 @@ async function _doFaceSave() {
   }
 }
 
-// ── Manual save button ──────────────────────────────────────────────────────
-$('btn-save').addEventListener('click', async () => {
-  const btn = $('btn-save');
-  btn.disabled = true;
-  btn.textContent = '💾 Saving…';
-  try {
-    // Save both thumb cache and face data, then reset auto-save timers
-    if (thumbCacheDirty) {
-      thumbCacheDirty = false;
-      await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
-    }
-    if (thumbSaveTimer) { clearTimeout(thumbSaveTimer); thumbSaveTimer = null; }
-    await _doFaceSave();
-    // Reset face save timer (cancels any pending scheduled save)
-    if (_faceSaveTimer) { clearTimeout(_faceSaveTimer); _faceSaveTimer = null; }
-    btn.textContent = '💾 Saved!';
-    btn.classList.add('saved');
-    setTimeout(() => { btn.textContent = '💾 Save'; btn.classList.remove('saved'); }, 1500);
-  } catch (e) {
-    console.error('[Save] Manual save failed:', e);
-    btn.textContent = '💾 Save';
-  } finally {
-    btn.disabled = false;
+// ── File Menu ─────────────────────────────────────────────────────────────────
+{
+  const menuBtn = $('file-menu-btn');
+  const menuDrop = $('file-menu-dropdown');
+  let menuOpen = false;
+
+  function toggleMenu(open) {
+    menuOpen = typeof open === 'boolean' ? open : !menuOpen;
+    menuDrop.classList.toggle('open', menuOpen);
+    menuBtn.classList.toggle('open', menuOpen);
   }
-});
+
+  menuBtn.addEventListener('click', e => { e.stopPropagation(); toggleMenu(); });
+  document.addEventListener('click', () => { if (menuOpen) toggleMenu(false); });
+  menuDrop.addEventListener('click', e => e.stopPropagation());
+
+  // ── Save now ──
+  $('btn-save').addEventListener('click', async () => {
+    toggleMenu(false);
+    const btn = $('btn-save');
+    btn.disabled = true;
+    btn.textContent = '⏳ Saving…';
+    try {
+      if (thumbCacheDirty) {
+        thumbCacheDirty = false;
+        await storage.setRaw(THUMB_CACHE_KEY, JSON.stringify(thumbCache));
+      }
+      if (thumbSaveTimer) { clearTimeout(thumbSaveTimer); thumbSaveTimer = null; }
+      await _doFaceSave();
+      if (_faceSaveTimer) { clearTimeout(_faceSaveTimer); _faceSaveTimer = null; }
+      if (_faceSaveIdleCb) { cancelIdleCallback(_faceSaveIdleCb); _faceSaveIdleCb = null; }
+      btn.textContent = '✓ Saved!';
+      setTimeout(() => { btn.textContent = '💾 Save Now'; }, 1500);
+    } catch (e) {
+      console.error('[Save] Manual save failed:', e);
+      btn.textContent = '💾 Save Now';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ── Export full backup ──
+  $('menu-export').addEventListener('click', async () => {
+    toggleMenu(false);
+    const btn = $('menu-export');
+    btn.disabled = true;
+    btn.textContent = '⏳ Exporting…';
+    try {
+      // Flush pending saves first
+      await flushFaceDataSave();
+      if (thumbCacheDirty) {
+        thumbCacheDirty = false;
+        await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
+      }
+      const allData = await storage.get(null);
+      // Remove auth tokens from export for security
+      const exportData = { ...allData };
+      delete exportData.accessToken;
+      delete exportData.refreshToken;
+      delete exportData.appKey;
+      exportData._exportVersion = 1;
+      exportData._exportDate = new Date().toISOString();
+      const json = JSON.stringify(exportData);
+      const ok = await invoke('export_data', { jsonData: json });
+      btn.textContent = ok ? '✓ Exported!' : '📤 Export Backup';
+      if (ok) setTimeout(() => { btn.textContent = '📤 Export Backup'; }, 2000);
+    } catch (e) {
+      console.error('[Export] Failed:', e);
+      btn.textContent = '❌ Failed';
+      setTimeout(() => { btn.textContent = '📤 Export Backup'; }, 2000);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ── Import backup ──
+  $('menu-import').addEventListener('click', async () => {
+    toggleMenu(false);
+    const btn = $('menu-import');
+    btn.disabled = true;
+    btn.textContent = '⏳ Reading…';
+    try {
+      const result = await invoke('import_data');
+      if (!result) { btn.textContent = '📥 Import Backup'; btn.disabled = false; return; }
+      let imported;
+      try { imported = JSON.parse(result); } catch (_) {
+        btn.textContent = '❌ Invalid file';
+        setTimeout(() => { btn.textContent = '📥 Import Backup'; }, 2000);
+        btn.disabled = false;
+        return;
+      }
+      // Validate it looks like our backup
+      if (!imported || typeof imported !== 'object') {
+        btn.textContent = '❌ Invalid format';
+        setTimeout(() => { btn.textContent = '📥 Import Backup'; }, 2000);
+        btn.disabled = false;
+        return;
+      }
+      // Remove export metadata before importing
+      delete imported._exportVersion;
+      delete imported._exportDate;
+      // Don't overwrite current auth tokens
+      delete imported.accessToken;
+      delete imported.refreshToken;
+      delete imported.appKey;
+
+      btn.textContent = '⏳ Importing…';
+      // Write all entries to the store
+      await storage.set(imported);
+
+      // Reload in-memory caches from the newly imported data
+      if (imported[THUMB_CACHE_KEY]) {
+        thumbCache = imported[THUMB_CACHE_KEY];
+        thumbCacheCount = Object.keys(thumbCache).length;
+      }
+      const faceKey = 'faceDataStore_v3';
+      if (imported[faceKey]) {
+        await FaceScan.loadFaceData(storage);
+      }
+      btn.textContent = '✓ Imported!';
+      setTimeout(() => { btn.textContent = '📥 Import Backup'; location.reload(); }, 1500);
+    } catch (e) {
+      console.error('[Import] Failed:', e);
+      btn.textContent = '❌ Failed';
+      setTimeout(() => { btn.textContent = '📥 Import Backup'; }, 2000);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // ── Export thumbnails only ──
+  $('menu-export-thumbs').addEventListener('click', async () => {
+    toggleMenu(false);
+    const btn = $('menu-export-thumbs');
+    btn.disabled = true;
+    btn.textContent = '⏳ Exporting…';
+    try {
+      if (thumbCacheDirty) {
+        thumbCacheDirty = false;
+        await storage.set({ [THUMB_CACHE_KEY]: thumbCache });
+      }
+      const exportData = {
+        _exportVersion: 1,
+        _exportDate: new Date().toISOString(),
+        _type: 'thumbnails',
+        [THUMB_CACHE_KEY]: thumbCache
+      };
+      const json = JSON.stringify(exportData);
+      const ok = await invoke('export_data', { jsonData: json });
+      btn.textContent = ok ? '✓ Exported!' : '🖼️ Export Thumbnails Only';
+      if (ok) setTimeout(() => { btn.textContent = '🖼️ Export Thumbnails Only'; }, 2000);
+    } catch (e) {
+      console.error('[Export Thumbs] Failed:', e);
+      btn.textContent = '❌ Failed';
+      setTimeout(() => { btn.textContent = '🖼️ Export Thumbnails Only'; }, 2000);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
 
 async function flushFaceDataSave() {
   if (_faceSaveTimer) {
@@ -238,6 +392,26 @@ async function flushFaceDataSave() {
   }
   await _doFaceSave();
 }
+
+// ── Save on close ─────────────────────────────────────────────────────────────
+// Flush any pending face data + thumb cache when the window is about to close.
+window.addEventListener('beforeunload', () => {
+  if (_faceSaveTimer) {
+    clearTimeout(_faceSaveTimer);
+    _faceSaveTimer = null;
+    // Fire-and-forget — browser may or may not complete this
+    _doFaceSave();
+  }
+  if (_faceSaveIdleCb) {
+    cancelIdleCallback(_faceSaveIdleCb);
+    _faceSaveIdleCb = null;
+    _doFaceSave();
+  }
+  if (thumbCacheDirty) {
+    thumbCacheDirty = false;
+    storage.setRaw(THUMB_CACHE_KEY, JSON.stringify(thumbCache));
+  }
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
@@ -753,6 +927,11 @@ function showMorePhotos() {
   if (needThumbPhotos.length > 0) {
     loadThumbnailsForCells(needThumbPhotos, needThumbCells);
   }
+
+  // Upgrade newly loaded cells if cluster slider is above base size
+  if (peopleClusterId && _clusterThumbSize > 128) {
+    upgradeClusterDetailThumbs(_clusterThumbSize);
+  }
 }
 
 function resetAndShowPhotos() {
@@ -833,7 +1012,7 @@ async function buildPhotoDateMap() {
 function getClusterThumb(cluster) {
   // Use manually chosen poster if set and cached
   if (cluster.posterPhoto && thumbCache[cluster.posterPhoto]) {
-    return { thumb: thumbCache[cluster.posterPhoto], hasAny: true };
+    return { thumb: thumbCache[cluster.posterPhoto], path: cluster.posterPhoto, hasAny: true };
   }
   let best = null;
   let bestTime = -1;
@@ -847,7 +1026,7 @@ function getClusterThumb(cluster) {
       best = p;
     }
   }
-  return { thumb: best ? thumbCache[best] : null, hasAny };
+  return { thumb: best ? thumbCache[best] : null, path: best, hasAny };
 }
 
 function sortPhotosNewest(arr) {
@@ -1003,6 +1182,11 @@ async function openLightbox(idx) {
   const video = isVideo(entry);
   lightboxName.textContent = entry.name;
 
+  // Update info panel if open
+  if ($('lightbox-info-panel').classList.contains('open')) {
+    buildInfoPanel(entry);
+  }
+
   // Show thumbnail instantly while full image loads
   if (thumbCache[path]) {
     lightboxImg.src = thumbCache[path];
@@ -1054,10 +1238,95 @@ function closeLightbox() {
   }
   vid.pause(); vid.src = '';
   lightbox.classList.remove('open');
+  $('lightbox-info-panel').classList.remove('open');
+  $('lightbox-info-btn').classList.remove('active');
+}
+
+function formatFileSize(bytes) {
+  if (!bytes) return '—';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
+}
+
+function buildInfoPanel(entry) {
+  const panel = $('lightbox-info-panel');
+  let html = '<button class="info-panel-close" title="Close info">✕</button>';
+  html += '<h3>File</h3>';
+  html += `<div class="info-row"><span class="info-label">Name</span><span class="info-value">${esc(entry.name)}</span></div>`;
+  html += `<div class="info-row"><span class="info-label">Path</span><span class="info-value">${esc(entry.path_display || entry.path_lower)}</span></div>`;
+  html += `<div class="info-row"><span class="info-label">Size</span><span class="info-value">${formatFileSize(entry.size)}</span></div>`;
+
+  const mi = entry.media_info?.metadata;
+  if (mi) {
+    html += '<h3>Media</h3>';
+    if (mi.dimensions) {
+      html += `<div class="info-row"><span class="info-label">Dimensions</span><span class="info-value">${mi.dimensions.width} × ${mi.dimensions.height}</span></div>`;
+    }
+    if (mi.time_taken) {
+      const dt = new Date(mi.time_taken);
+      html += `<div class="info-row"><span class="info-label">Taken</span><span class="info-value">${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}</span></div>`;
+    }
+    if (mi.location) {
+      html += `<div class="info-row"><span class="info-label">Latitude</span><span class="info-value">${mi.location.latitude.toFixed(6)}</span></div>`;
+      html += `<div class="info-row"><span class="info-label">Longitude</span><span class="info-value">${mi.location.longitude.toFixed(6)}</span></div>`;
+    }
+    if (mi.duration) {
+      const secs = Math.round(mi.duration / 1000);
+      const m = Math.floor(secs / 60), s = secs % 60;
+      html += `<div class="info-row"><span class="info-label">Duration</span><span class="info-value">${m}:${String(s).padStart(2, '0')}</span></div>`;
+    }
+  }
+
+  html += '<h3>Dates</h3>';
+  if (entry.client_modified) {
+    const dt = new Date(entry.client_modified);
+    html += `<div class="info-row"><span class="info-label">Modified</span><span class="info-value">${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}</span></div>`;
+  }
+  if (entry.server_modified) {
+    const dt = new Date(entry.server_modified);
+    html += `<div class="info-row"><span class="info-label">Uploaded</span><span class="info-value">${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}</span></div>`;
+  }
+
+  // Face data
+  const fd = FaceScan.getFaceData();
+  const faces = fd.photos?.[entry.path_lower];
+  if (faces && faces.length > 0) {
+    // Build a map of which clusters contain this photo
+    const matchingClusters = fd.clusters?.filter(c => c.photos.includes(entry.path_lower)) || [];
+    html += `<h3>Faces (${faces.length})</h3>`;
+    for (let i = 0; i < faces.length; i++) {
+      const f = faces[i];
+      const name = matchingClusters[i]?.name || matchingClusters[0]?.name || 'Unknown';
+      html += `<div class="info-row"><span class="info-label">Face ${i + 1}</span><span class="info-value">${esc(name)} (score ${f.score?.toFixed(2) || '—'})</span></div>`;
+    }
+  }
+
+  if (entry.content_hash) {
+    html += '<h3>Hash</h3>';
+    html += `<div class="info-row"><span class="info-label">Content</span><span class="info-value" style="font-size:9px;">${entry.content_hash}</span></div>`;
+  }
+
+  panel.innerHTML = html;
+  panel.querySelector('.info-panel-close').addEventListener('click', () => {
+    panel.classList.remove('open');
+    $('lightbox-info-btn').classList.remove('active');
+  });
 }
 
 $('lightbox-close').addEventListener('click', closeLightbox);
 $('lightbox-download').addEventListener('click', downloadCurrentPhoto);
+$('lightbox-info-btn').addEventListener('click', () => {
+  const panel = $('lightbox-info-panel');
+  const btn = $('lightbox-info-btn');
+  const isOpen = panel.classList.toggle('open');
+  btn.classList.toggle('active', isOpen);
+  if (isOpen) {
+    const entry = filteredIndex[lightboxIdx];
+    if (entry) buildInfoPanel(entry);
+  }
+});
 $('lightbox-prev').addEventListener('click', () => openLightbox(lightboxIdx - 1));
 $('lightbox-next').addEventListener('click', () => openLightbox(lightboxIdx + 1));
 lightbox.addEventListener('click', e => { if (e.target === lightbox) closeLightbox(); });
@@ -1066,6 +1335,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeLightbox();
   if (e.key === 'ArrowLeft')  openLightbox(lightboxIdx - 1);
   if (e.key === 'ArrowRight') openLightbox(lightboxIdx + 1);
+  if (e.key === 'i' || e.key === 'I') $('lightbox-info-btn').click();
 });
 
 // ── Download helpers ──────────────────────────────────────────────────────────
@@ -1367,6 +1637,8 @@ const DROPBOX_THUMB_SIZES = [
 ];
 let _timelineThumbCache = {};   // keyed by `${sizeTag}::${path}`
 let _timelineCurrentSize = 160; // current slider value in px
+let _peopleThumbSize = 140;     // people grid card size in px
+let _clusterThumbSize = 120;    // cluster detail photo cell size in px
 
 $('btn-timeline').addEventListener('click', () => {
   if (timelineMode) {
@@ -1440,6 +1712,87 @@ async function fetchTimelineThumb(path, sizeTag) {
     console.error('[Timeline] Thumb fetch failed:', e);
   }
   return thumbCache[path] || null;
+}
+
+// Batch-fetch higher-quality thumbnails and apply to img elements
+// entries: [{ path, img }]  — path is the Dropbox path, img is the DOM element to update
+let _upgradeGeneration = 0; // incremented on each slider change to cancel stale batches
+async function batchUpgradeThumbs(entries, sizeTag) {
+  const gen = ++_upgradeGeneration;
+  const BATCH = 25;
+  for (let i = 0; i < entries.length; i += BATCH) {
+    if (gen !== _upgradeGeneration) return; // newer slider event — abort this run
+    const slice = entries.slice(i, i + BATCH);
+    const apiEntries = slice.map(e => ({ path: e.path, format: { '.tag': 'jpeg' }, size: { '.tag': sizeTag } }));
+    try {
+      const doFetch = () => fetch('https://content.dropboxapi.com/2/files/get_thumbnail_batch', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + accessToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ entries: apiEntries })
+      });
+      let res = await doFetch();
+      if (res.status === 401 && refreshToken) {
+        try { await refreshAccessToken(); } catch (_) {}
+        res = await doFetch();
+      }
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!data.entries) continue;
+      for (let j = 0; j < slice.length; j++) {
+        const entry = data.entries[j];
+        if (entry?.['.tag'] === 'success' && entry.thumbnail) {
+          const dataUrl = 'data:image/jpeg;base64,' + entry.thumbnail;
+          _timelineThumbCache[sizeTag + '::' + slice[j].path] = dataUrl;
+          slice[j].img.src = dataUrl;
+        }
+      }
+    } catch (e) {
+      console.error('[batchUpgrade] Batch failed:', e);
+    }
+  }
+}
+
+// Upgrade people grid face thumbnails to higher quality when slider increases
+function upgradePeopleGridThumbs(displayPx) {
+  const needed = pickThumbSize(displayPx);
+  if (needed.tag === 'w128h128') return;
+  const toUpgrade = [];
+  const imgs = peopleView.querySelectorAll('.face-thumb');
+  for (const img of imgs) {
+    const path = img.dataset.thumbPath;
+    if (!path) continue;
+    const cacheKey = needed.tag + '::' + path;
+    if (_timelineThumbCache[cacheKey]) {
+      img.src = _timelineThumbCache[cacheKey];
+    } else {
+      toUpgrade.push({ path, img });
+    }
+  }
+  if (toUpgrade.length > 0) batchUpgradeThumbs(toUpgrade, needed.tag);
+}
+
+// Upgrade cluster detail photo thumbnails to higher quality when slider increases
+function upgradeClusterDetailThumbs(displayPx) {
+  const needed = pickThumbSize(displayPx);
+  if (needed.tag === 'w128h128') return;
+  const toUpgrade = [];
+  const cells = photoGrid.querySelectorAll('.photo-cell');
+  for (const cell of cells) {
+    const path = cell.dataset.thumbPath;
+    if (!path) continue;
+    const img = cell.querySelector('img');
+    if (!img) continue;
+    const cacheKey = needed.tag + '::' + path;
+    if (_timelineThumbCache[cacheKey]) {
+      img.src = _timelineThumbCache[cacheKey];
+    } else {
+      toUpgrade.push({ path, img });
+    }
+  }
+  if (toUpgrade.length > 0) batchUpgradeThumbs(toUpgrade, needed.tag);
 }
 
 function buildTimelineData(clusterId) {
@@ -1586,14 +1939,22 @@ function renderTimelineView(selectedClusterId) {
     renderTimelineContent(cnt, cid, parseInt(sizeSlider.value, 10));
   });
 
-  // Event: size changed
+  // Event: size changed — resize immediately, batch-fetch on release
   sizeSlider.addEventListener('input', () => {
-    const px = parseInt(sizeSlider.value, 10);
+    const px = Number.parseInt(sizeSlider.value, 10);
     _timelineCurrentSize = px;
     sizeValue.textContent = px + 'px';
+    // Resize existing images instantly via CSS
+    const imgs = document.querySelectorAll('.timeline-month-card img');
+    const lbls = document.querySelectorAll('.timeline-month-card .month-label');
+    for (const img of imgs) { img.style.width = px + 'px'; img.style.height = px + 'px'; }
+    for (const lbl of lbls) { lbl.style.width = px + 'px'; }
+  });
+  sizeSlider.addEventListener('change', () => {
+    const px = _timelineCurrentSize;
     const cid = select.value;
     if (cid) {
-      renderTimelineContent(document.getElementById('timeline-content'), cid, px);
+      upgradeTimelineThumbs(px);
     }
   });
 }
@@ -1629,12 +1990,16 @@ function renderTimelineContent(container, clusterId, thumbPx) {
       const img = document.createElement('img');
       img.style.width = thumbPx + 'px';
       img.style.height = thumbPx + 'px';
+      img.dataset.thumbPath = m.path;
       // Use existing low-res thumb as placeholder
       if (thumbCache[m.path]) {
         img.src = thumbCache[m.path];
       }
       // Load appropriate quality thumb
-      loadTimelineThumb(img, m.path, sizeInfo.tag, thumbPx);
+      const cacheKey = sizeInfo.tag + '::' + m.path;
+      if (_timelineThumbCache[cacheKey]) {
+        img.src = _timelineThumbCache[cacheKey];
+      }
       card.appendChild(img);
 
       const lbl = document.createElement('div');
@@ -1664,15 +2029,28 @@ function renderTimelineContent(container, clusterId, thumbPx) {
     frag.appendChild(yearDiv);
   }
   container.appendChild(frag);
+
+  // Batch-fetch any thumbnails not already cached
+  upgradeTimelineThumbs(thumbPx);
 }
 
-async function loadTimelineThumb(imgEl, path, sizeTag, displayPx) {
-  const dataUrl = await fetchTimelineThumb(path, sizeTag);
-  if (dataUrl) {
-    imgEl.src = dataUrl;
-    imgEl.style.width = displayPx + 'px';
-    imgEl.style.height = displayPx + 'px';
+// Upgrade all timeline card images to higher quality via batch API
+function upgradeTimelineThumbs(displayPx) {
+  const needed = pickThumbSize(displayPx);
+  if (needed.tag === 'w128h128') return;
+  const toUpgrade = [];
+  const imgs = document.querySelectorAll('.timeline-month-card img');
+  for (const img of imgs) {
+    const path = img.dataset.thumbPath;
+    if (!path) continue;
+    const cacheKey = needed.tag + '::' + path;
+    if (_timelineThumbCache[cacheKey]) {
+      img.src = _timelineThumbCache[cacheKey];
+    } else {
+      toUpgrade.push({ path, img });
+    }
   }
+  if (toUpgrade.length > 0) batchUpgradeThumbs(toUpgrade, needed.tag);
 }
 
 async function showPeopleView() {
@@ -1688,6 +2066,10 @@ async function showPeopleView() {
   timelineView.classList.remove('visible');
   timelineView.innerHTML = '';
   document.querySelectorAll('.singles-grid').forEach(g => g.remove());
+  document.querySelectorAll('.people-header').forEach(h => h.remove());
+  const sliderRow2 = document.getElementById('cluster-size-slider-row');
+  if (sliderRow2) sliderRow2.remove();
+  photoGrid.style.removeProperty('--cell-size');
 
   photoGrid.style.display = 'none';
   folderList.style.display = 'none';
@@ -1721,6 +2103,10 @@ function exitPeopleMode() {
   timelineView.classList.remove('visible');
   timelineView.innerHTML = '';
   document.querySelectorAll('.singles-grid').forEach(g => g.remove());
+  document.querySelectorAll('.people-header').forEach(h => h.remove());
+  const exitSliderRow = document.getElementById('cluster-size-slider-row');
+  if (exitSliderRow) exitSliderRow.remove();
+  photoGrid.style.removeProperty('--cell-size');
   photoGrid.style.display = '';
   folderList.style.display = '';
 
@@ -1742,10 +2128,11 @@ function renderPeopleGrid() {
 
   // Pre-compute thumbs for all clusters in a single pass
   const clusterThumbs = new Map();
+  const clusterThumbPaths = new Map();
   let visibleCount = 0;
   for (const c of clusters) {
     const result = getClusterThumb(c);
-    if (result.thumb) { clusterThumbs.set(c.id, result.thumb); visibleCount++; }
+    if (result.thumb) { clusterThumbs.set(c.id, result.thumb); clusterThumbPaths.set(c.id, result.path); visibleCount++; }
   }
   peopleView.innerHTML = '';
 
@@ -1867,6 +2254,28 @@ function renderPeopleGrid() {
     peopleView.appendChild(bar);
   }
 
+  // Size slider
+  const sliderRow = document.createElement('div');
+  sliderRow.className = 'size-slider-row';
+  sliderRow.innerHTML = `
+    <label>Size</label>
+    <input type="range" min="80" max="300" step="10" value="${_peopleThumbSize}">
+    <span class="size-value">${_peopleThumbSize}px</span>
+  `;
+  peopleView.appendChild(sliderRow);
+  const pSlider = sliderRow.querySelector('input[type="range"]');
+  const pLabel = sliderRow.querySelector('.size-value');
+  pSlider.addEventListener('input', () => {
+    const px = Number.parseInt(pSlider.value);
+    _peopleThumbSize = px;
+    pLabel.textContent = px + 'px';
+    peopleView.style.setProperty('--people-thumb-size', px + 'px');
+  });
+  pSlider.addEventListener('change', () => {
+    upgradePeopleGridThumbs(_peopleThumbSize);
+  });
+  peopleView.style.setProperty('--people-thumb-size', _peopleThumbSize + 'px');
+
   if (visibleCount === 0) {
     const empty = document.createElement('div');
     empty.style.cssText = 'text-align:center;padding:40px;color:#555;font-size:13px;';
@@ -1924,6 +2333,7 @@ function renderPeopleGrid() {
     img.className = 'face-thumb';
     img.src = thumb;
     img.alt = cluster.name || 'Unknown person';
+    img.dataset.thumbPath = clusterThumbPaths.get(cluster.id) || '';
     card.appendChild(img);
 
     const info = document.createElement('div');
@@ -1933,13 +2343,6 @@ function renderPeopleGrid() {
     nameEl.className = 'person-name';
     nameEl.textContent = cluster.name || 'Unknown';
     info.appendChild(nameEl);
-
-    const idEl = document.createElement('div');
-    idEl.className = 'person-count';
-    idEl.style.fontSize = '9px';
-    idEl.style.opacity = '0.5';
-    idEl.textContent = cluster.id;
-    info.appendChild(idEl);
 
     const countEl = document.createElement('div');
     countEl.className = 'person-count';
@@ -2032,6 +2435,11 @@ function renderPeopleGrid() {
       FaceScan.saveFaceData(storage);
     });
   }
+
+  // Upgrade thumbnails if slider is above base size
+  if (_peopleThumbSize > 128) {
+    upgradePeopleGridThumbs(_peopleThumbSize);
+  }
 }
 
 // ── Multi-select helpers for person detail view ──────────────────────────────
@@ -2110,7 +2518,7 @@ function updateBulkActionBar() {
     if (updated && sub) {
       sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
     }
-    scheduleFaceDataSave();
+    scheduleFaceDataSave(true);
   });
   bar.appendChild(removeBtn);
 
@@ -2158,6 +2566,7 @@ function createPersonPhotoWrap(photoEntry, gridIdx, clusterId) {
   const cell = document.createElement('div');
   cell.className = 'photo-cell';
   cell.dataset.idx = gridIdx;
+  cell.dataset.thumbPath = photoEntry.path_lower;
 
   const cached = thumbCache[photoEntry.path_lower];
   if (cached) {
@@ -2230,14 +2639,14 @@ photoGrid.addEventListener('click', async (e) => {
       if (updated && sub) {
         sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
       }
-      scheduleFaceDataSave();
+      scheduleFaceDataSave(true);
     } else if (action === 'move') {
       showReassignModal(clusterId, photoPath, wrap);
     } else if (action === 'poster') {
       FaceScan.setClusterPoster(clusterId, photoPath);
       actionBtn.textContent = '\u2713';
       setTimeout(() => { actionBtn.textContent = '\u2b50'; }, 1000);
-      scheduleFaceDataSave();
+      scheduleFaceDataSave(true);
     }
     return;
   }
@@ -2304,12 +2713,6 @@ function showSinglesView(singles) {
     nameEl.className = 'person-name';
     nameEl.textContent = 'Unknown';
     info.appendChild(nameEl);
-    const idEl = document.createElement('div');
-    idEl.className = 'person-count';
-    idEl.style.fontSize = '9px';
-    idEl.style.opacity = '0.5';
-    idEl.textContent = cluster.id;
-    info.appendChild(idEl);
     const countEl = document.createElement('div');
     countEl.className = 'person-count';
     countEl.textContent = '1 photo';
@@ -2349,6 +2752,9 @@ function showPersonPhotos(clusterId) {
   photoGrid.innerHTML = '';
   loadMoreBtn.classList.remove('visible');
   document.querySelectorAll('.people-header').forEach(h => h.remove());
+  const existingSliderRow = document.getElementById('cluster-size-slider-row');
+  if (existingSliderRow) existingSliderRow.remove();
+  photoGrid.style.removeProperty('--cell-size');
 
   // Header bar for person view
   const header = document.createElement('div');
@@ -2488,11 +2894,37 @@ function showPersonPhotos(clusterId) {
   backBtn.addEventListener('click', () => {
     cleanupBulkSelection();
     header.remove();
+    const sr = document.getElementById('cluster-size-slider-row');
+    if (sr) sr.remove();
+    photoGrid.style.removeProperty('--cell-size');
     showPeopleView();
   });
   header.appendChild(backBtn);
 
   document.getElementById('top-bars').appendChild(header);
+
+  // Size slider for cluster detail view
+  const clusterSliderRow = document.createElement('div');
+  clusterSliderRow.className = 'size-slider-row';
+  clusterSliderRow.id = 'cluster-size-slider-row';
+  clusterSliderRow.innerHTML = `
+    <label>Size</label>
+    <input type="range" min="80" max="300" step="10" value="${_clusterThumbSize}">
+    <span class="size-value">${_clusterThumbSize}px</span>
+  `;
+  document.getElementById('top-bars').appendChild(clusterSliderRow);
+  const cSlider = clusterSliderRow.querySelector('input[type="range"]');
+  const cLabel = clusterSliderRow.querySelector('.size-value');
+  cSlider.addEventListener('input', () => {
+    const px = Number.parseInt(cSlider.value);
+    _clusterThumbSize = px;
+    cLabel.textContent = px + 'px';
+    photoGrid.style.setProperty('--cell-size', px + 'px');
+  });
+  cSlider.addEventListener('change', () => {
+    upgradeClusterDetailThumbs(_clusterThumbSize);
+  });
+  photoGrid.style.setProperty('--cell-size', _clusterThumbSize + 'px');
 
   // Filter to person's photos and display with selection + action overlays
   const personPhotos = photoIndex.filter(p => clusterPhotoPaths.has(p.path_lower));
@@ -2546,6 +2978,11 @@ function showPersonPhotos(clusterId) {
   if (needThumbPhotos.length > 0) {
     loadThumbnailsForCells(needThumbPhotos, needThumbCells);
   }
+
+  // Upgrade thumbnails if slider is above base size
+  if (_clusterThumbSize > 128) {
+    upgradeClusterDetailThumbs(_clusterThumbSize);
+  }
 }
 
 // ── New collection row for move modals ───────────────────────────────────
@@ -2583,7 +3020,7 @@ function createNewCollectionRow(modal, bg, fromClusterId, photoPaths, onDone) {
       if (newCluster) {
         bg.remove();
         onDone(newCluster);
-        scheduleFaceDataSave();
+        scheduleFaceDataSave(true);
       }
     });
     row.appendChild(confirmBtn);
@@ -2696,7 +3133,7 @@ function showMergeIntoModal(currentClusterId) {
     if (!confirm(`Merge "${cluster.name || 'Unknown'}" (${cluster.photoCount} photos) into this collection? This will remove "${cluster.name || 'Unknown'}" as a separate collection.`)) return;
     FaceScan.mergeClusters(currentClusterId, cluster.id);
     bg.remove();
-    scheduleFaceDataSave();
+    scheduleFaceDataSave(true);
     showPersonPhotos(currentClusterId);
   });
 
@@ -2746,7 +3183,7 @@ async function showReassignModal(fromClusterId, photoPath, photoWrapEl) {
       const sub = document.querySelector('.people-subtitle');
       if (sub) sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 hover a photo for options`;
     }
-    scheduleFaceDataSave();
+    scheduleFaceDataSave(true);
   });
 
   // Cancel button
@@ -2802,7 +3239,7 @@ async function showBulkReassignModal(fromClusterId, photoPaths) {
     if (updated && sub) {
       sub.textContent = `${updated.photoCount} photo${updated.photoCount !== 1 ? 's' : ''} \u00b7 click photos to select`;
     }
-    scheduleFaceDataSave();
+    scheduleFaceDataSave(true);
   });
 
   const cancelBtn = document.createElement('button');
